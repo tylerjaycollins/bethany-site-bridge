@@ -5,7 +5,7 @@
  *              site introspection, arbitrary post meta, and The Events Calendar
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose. Consumed by Atlas and by Claude Code.
- * Version:     0.7.1
+ * Version:     0.8.0
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -58,6 +58,20 @@
  *   PUT  /events/{ref}/recurrence   → replace rule + exclusions. dry_run ok.
  *
  * {ref} = post ID, TEC provisional occurrence ID, or slug. Prefer the SLUG.
+ *
+ * WHAT A REST CREATE SKIPS (and this plugin therefore does by hand).
+ * tribe_create_event() only does what TEC's own PHP API does. Twice now that has
+ * meant a created event was subtly unlike a hand-built one:
+ *   v0.7.0 — taxonomies. tax_input is silently dropped, so events were created
+ *            with NO category, and the category is what puts them on their
+ *            program page.
+ *   v0.8.0 — ACF field defaults. An ACF default is only applied on an ACF save,
+ *            and this path bypasses ACF, so fields land UNSET rather than
+ *            defaulted. That's why 15 events could carry a correct _EventURL and
+ *            still show no "Register Now" button.
+ * Both are now applied explicitly and READ BACK off the saved post, because "we
+ * asked for it" and "it stuck" are different claims. If a third such gap turns up,
+ * find it the same way: diff a created event's meta against a hand-built one.
  *
  * ⚠️ SAFETY — why the guards exist.
  * On 2026-08-10 a plain POST of start_date to a TEC *provisional occurrence ID*
@@ -950,6 +964,90 @@ function bsb_events_require_tec() {
 	return true;
 }
 
+/**
+ * Apply the ACF field-group defaults for tribe_events to a freshly created event.
+ *
+ * WHY THIS EXISTS: an ACF default value is only written during an ACF save, and
+ * tribe_create_event() bypasses ACF entirely. So a REST-created event has those
+ * fields UNSET rather than defaulted — which is not the same thing to the theme.
+ * Concretely: `use_event_url_for_registration` defaults to on and is what renders
+ * the "Register Now" button from _EventURL. Events created through this endpoint
+ * before v0.8.0 had a correct _EventURL and no button (all 15 fall-2026 Family
+ * Meals, 2026-08-11). Same shape as the v0.7.0 taxonomy bug: anything outside
+ * TEC's own PHP API doesn't happen unless we make it happen.
+ *
+ * Driven off ACF's own field groups rather than a hardcoded key list, so a field
+ * added to the group later is picked up without touching this plugin. Writes via
+ * update_field() with the field KEY, which is what correctly stores both halves of
+ * ACF's `name` => value / `_name` => key pair — writing the value alone leaves the
+ * field unrecognized and inert.
+ *
+ * @param int   $post_id   The new event.
+ * @param array $overrides field name => value from the caller; wins over the default.
+ * @return array{applied: array|null, note: string|null}
+ */
+function bsb_events_apply_acf_defaults( $post_id, array $overrides = array() ) {
+	if ( ! function_exists( 'acf_get_field_groups' ) || ! function_exists( 'update_field' ) ) {
+		return array( 'applied' => null, 'note' => 'ACF not active — no field defaults applied' );
+	}
+
+	$groups = acf_get_field_groups( array( 'post_type' => 'tribe_events' ) );
+	if ( ! $groups ) {
+		return array( 'applied' => array(), 'note' => 'no ACF field groups target tribe_events' );
+	}
+
+	$applied = array();
+	foreach ( $groups as $group ) {
+		$fields = acf_get_fields( $group );
+		if ( ! $fields ) {
+			continue;
+		}
+		foreach ( $fields as $field ) {
+			$name = isset( $field['name'] ) ? (string) $field['name'] : '';
+			if ( $name === '' || empty( $field['key'] ) ) {
+				continue;
+			}
+
+			$has_override = array_key_exists( $name, $overrides );
+
+			// Never clobber a value that's already on the post. tribe_create_event()
+			// doesn't set these, but a filter or another plugin might, and a default
+			// silently overwriting a real value would be a worse bug than the one
+			// this function fixes.
+			if ( ! $has_override && metadata_exists( 'post', $post_id, $name ) ) {
+				continue;
+			}
+
+			$value = $has_override
+				? $overrides[ $name ]
+				: ( array_key_exists( 'default_value', $field ) ? $field['default_value'] : '' );
+
+			update_field( $field['key'], $value, $post_id );
+			$applied[ $name ] = $value;
+		}
+	}
+
+	return array( 'applied' => $applied, 'note' => null );
+}
+
+/**
+ * Currency meta TEC writes on a normal admin save but skips on the REST path.
+ * Cosmetic while cost is empty, but it's part of looking like a hand-built event.
+ */
+function bsb_events_apply_tec_defaults( $post_id ) {
+	$defaults = array(
+		'_EventCurrencyCode'     => 'USD',
+		'_EventCurrencySymbol'   => '$',
+		'_EventCurrencyPosition' => 'prefix',
+	);
+	foreach ( $defaults as $key => $value ) {
+		if ( ! metadata_exists( 'post', $post_id, $key ) ) {
+			update_post_meta( $post_id, $key, $value );
+		}
+	}
+	return array_keys( $defaults );
+}
+
 /** POST /events — create a single or recurring event. */
 function bsb_events_create( WP_REST_Request $req ) {
 	$dry = filter_var( $req->get_param( 'dry_run' ), FILTER_VALIDATE_BOOLEAN );
@@ -1014,6 +1112,14 @@ function bsb_events_create( WP_REST_Request $req ) {
 	$tags  = $req->get_param( 'tags' ) ? array_map( 'intval', (array) $req->get_param( 'tags' ) ) : array();
 	$thumb = $req->get_param( 'featured_media' ) ? (int) $req->get_param( 'featured_media' ) : 0;
 
+	// ACF field-group defaults are applied unless the caller opts out. Defaulting to
+	// ON is the point of the fix: the failure mode this prevents is silent, so a
+	// caller who doesn't know to ask is exactly the caller who needs it.
+	$apply_acf = $req->get_param( 'apply_acf_defaults' ) === null
+		? true
+		: filter_var( $req->get_param( 'apply_acf_defaults' ), FILTER_VALIDATE_BOOLEAN );
+	$acf_overrides = (array) ( $req->get_param( 'acf' ) ? $req->get_param( 'acf' ) : array() );
+
 	if ( $recurrence ) {
 		$args['recurrence'] = $recurrence;
 	}
@@ -1050,11 +1156,28 @@ function bsb_events_create( WP_REST_Request $req ) {
 		set_post_thumbnail( $post_id, $thumb );
 	}
 
+	// ACF field-group defaults + TEC's currency meta — neither of which
+	// tribe_create_event() writes. See bsb_events_apply_acf_defaults().
+	$acf_result = array( 'applied' => null, 'note' => 'skipped via apply_acf_defaults=false' );
+	if ( $apply_acf ) {
+		$acf_result = bsb_events_apply_acf_defaults( $post_id, $acf_overrides );
+		bsb_events_apply_tec_defaults( $post_id );
+	}
+
 	// Read the terms back off the post rather than echoing the request — that's the
 	// difference between "we asked for it" and "it actually stuck".
 	$applied_cats = wp_get_object_terms( $post_id, 'tribe_events_cat', array( 'fields' => 'names' ) );
 	$applied_tags = wp_get_object_terms( $post_id, 'post_tag', array( 'fields' => 'names' ) );
 	$applied_thumb = (int) get_post_thumbnail_id( $post_id );
+
+	// Same principle for ACF: report what the POST now holds, not what we sent.
+	$acf_readback = null;
+	if ( is_array( $acf_result['applied'] ) && function_exists( 'get_field' ) ) {
+		$acf_readback = array();
+		foreach ( array_keys( $acf_result['applied'] ) as $field_name ) {
+			$acf_readback[ $field_name ] = get_field( $field_name, $post_id );
+		}
+	}
 
 	// Same TEC regeneration lag as on update — wait before reporting.
 	$expected = $preview ? $preview['generated'] : array();
@@ -1068,6 +1191,8 @@ function bsb_events_create( WP_REST_Request $req ) {
 		'categories'       => is_wp_error( $applied_cats ) ? null : $applied_cats,
 		'tags'             => is_wp_error( $applied_tags ) ? null : $applied_tags,
 		'featured_media'   => $applied_thumb ? $applied_thumb : null,
+		'acf_defaults'     => $acf_readback,
+		'acf_note'         => $acf_result['note'],
 		'preview'          => $preview,
 		'occurrence_count' => is_array( $occ ) ? count( $occ ) : null,
 		'occurrence_dates' => is_array( $occ ) ? wp_list_pluck( $occ, 'date' ) : null,
