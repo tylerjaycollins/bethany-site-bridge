@@ -9,10 +9,12 @@ name: Release plugin zip
 # treat as a DIFFERENT plugin and install alongside the old one instead of updating it.
 # That's why we build the archive by hand here rather than using the zipball URL.
 
+# Tag-only on purpose. A manual workflow_dispatch run has no tag, so the
+# tag-vs-header-vs-manifest check below can never pass — keeping that trigger around
+# just produces a red run that looks like a real failure. Release by tagging.
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: write
