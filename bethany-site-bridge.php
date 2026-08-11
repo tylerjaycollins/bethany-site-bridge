@@ -5,7 +5,7 @@
  *              site introspection, arbitrary post meta, and The Events Calendar
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose. Consumed by Atlas and by Claude Code.
- * Version:     0.8.0
+ * Version:     0.8.1
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -50,6 +50,7 @@
  *
  * ENDPOINTS (base <site>/wp-json/atlas/v1)
  *   GET  /site                      → environment + capability report
+ *   POST /site/check-updates        → force core's plugin update check (see below)
  *   GET  /meta/{ref}                → post meta (all, or ?keys=a,b)
  *   PUT  /meta/{ref}                → write meta. Requires confirm=true.
  *   GET  /events/{ref}/recurrence   → raw _EventRecurrence + occurrence list
@@ -99,6 +100,9 @@ add_action( 'rest_api_init', function () {
 	// --- site ---
 	register_rest_route( 'atlas/v1', '/site', array(
 		array( 'methods' => 'GET', 'callback' => 'bsb_site_report', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/site/check-updates', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_site_check_updates', 'permission_callback' => $auth ),
 	) );
 
 	// --- meta ---
@@ -352,6 +356,68 @@ function bsb_update_status( $force = false ) {
 		'update_available' => version_compare( $m['version'], $installed, '>' ),
 		'manifest'         => BSB_UPDATE_MANIFEST,
 	);
+}
+
+/**
+ * POST /site/check-updates — force WordPress to re-run its own plugin update check.
+ *
+ * WHY THIS EXISTS: **two different caches** decide whether the "Update now" link
+ * appears in wp-admin, and refreshing the wrong one looks like the release failed.
+ *
+ *   1. THIS plugin's manifest cache (BSB_UPDATE_CACHE, 6h) — what
+ *      GET /site?refresh_update=1 busts. It only affects what /site *reports*.
+ *   2. Core's `update_plugins` site transient — what the Plugins screen actually
+ *      reads. Refreshed by wp_update_plugins() on WP-Cron, roughly every 12h, and
+ *      WP-Cron is traffic-triggered so it can lag much longer on a quiet site.
+ *
+ * After the 0.8.0 release /site correctly said `update_available: true` while
+ * wp-admin offered no update at all — cache 1 was fresh, cache 2 was stale. The
+ * documented workaround is Dashboard → Updates → "Check again", which is a button
+ * hunt at the end of every release. This does the same thing over REST so a release
+ * can end with "the button is now there" as a verified fact rather than a hope.
+ *
+ * Drops both caches, runs core's check synchronously, then reports which bucket of
+ * the transient this plugin landed in: `response` (update pending → the link is
+ * showing) or `no_update` (already current).
+ */
+function bsb_site_check_updates( WP_REST_Request $req ) {
+	unset( $req );
+	$file = plugin_basename( __FILE__ );
+
+	delete_site_transient( BSB_UPDATE_CACHE ); // ours, so the manifest is refetched
+	delete_site_transient( 'update_plugins' ); // core's, so wp_update_plugins() really runs
+
+	// Always loaded from wp-includes, but this endpoint is worthless if it isn't.
+	if ( ! function_exists( 'wp_update_plugins' ) ) {
+		require_once ABSPATH . WPINC . '/update.php';
+	}
+	wp_update_plugins();
+
+	$transient = get_site_transient( 'update_plugins' );
+	$pending   = is_object( $transient ) && isset( $transient->response[ $file ] );
+	$current   = is_object( $transient ) && isset( $transient->no_update[ $file ] );
+
+	// Read the answer out of core's transient rather than re-deriving it from the
+	// manifest: the question being asked is "does wp-admin show the button", and
+	// only the transient can answer that.
+	$offered = null;
+	if ( $pending && isset( $transient->response[ $file ]->new_version ) ) {
+		$offered = (string) $transient->response[ $file ]->new_version;
+	}
+
+	return rest_ensure_response( array(
+		'checked'          => true,
+		'plugin_file'      => $file,
+		'update_offered'   => $pending,
+		'offered_version'  => $offered,
+		'listed_as_current'=> $current,
+		'status'           => bsb_update_status( true ),
+		'note'             => $pending
+			? 'wp-admin is now offering the update — Plugins → Update now.'
+			: ( $current
+				? 'Core reports this plugin as already current; nothing to install.'
+				: 'This plugin is in NEITHER bucket of the update transient — core is not tracking it. Check the Update URI header and that the site can reach the manifest host.' ),
+	) );
 }
 
 /* ================================================================== *
