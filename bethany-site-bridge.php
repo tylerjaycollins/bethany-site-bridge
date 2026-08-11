@@ -5,7 +5,7 @@
  *              site introspection, arbitrary post meta, and The Events Calendar
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose. Consumed by Atlas and by Claude Code.
- * Version:     0.7.0
+ * Version:     0.7.1
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -267,6 +267,50 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
 			: array( 'description' => 'REST bridge for bethanycentral.org.' ),
 	);
 }, 10, 3 );
+
+/**
+ * Advertise "up to date" so wp-admin offers the auto-update toggle.
+ *
+ * WP only shows "Enable auto-updates" for a plugin it finds in the update_plugins
+ * transient — under `response` (update pending) or `no_update` (current). But core's
+ * Update URI path `continue`s past a plugin whose filter reports no update, so it lands
+ * in NEITHER bucket and the Plugins screen says "Auto-updates are not available for this
+ * plugin". Adding the no_update entry ourselves is what makes the toggle appear.
+ *
+ * Deliberately cheap — this fires on every transient read, so no HTTP here.
+ */
+add_filter( 'site_transient_update_plugins', function ( $transient ) {
+	if ( ! is_object( $transient ) ) {
+		return $transient;
+	}
+	$file = plugin_basename( __FILE__ );
+
+	// A real pending update wins; don't mask it.
+	if ( isset( $transient->response ) && is_array( $transient->response ) && isset( $transient->response[ $file ] ) ) {
+		return $transient;
+	}
+	if ( ! isset( $transient->no_update ) || ! is_array( $transient->no_update ) ) {
+		$transient->no_update = array();
+	}
+	if ( isset( $transient->no_update[ $file ] ) ) {
+		return $transient;
+	}
+
+	$transient->no_update[ $file ] = (object) array(
+		'id'           => BSB_UPDATE_URI,
+		'slug'         => BSB_SLUG,
+		'plugin'       => $file,
+		'new_version'  => bsb_installed_version(),
+		'url'          => BSB_UPDATE_URI,
+		'package'      => '',
+		'icons'        => array(),
+		'banners'      => array(),
+		'banners_rtl'  => array(),
+		'tested'       => '',
+		'requires_php' => '',
+	);
+	return $transient;
+} );
 
 /** Drop the cached manifest whenever WP finishes updating this plugin. */
 add_action( 'upgrader_process_complete', function ( $upgrader, $hook_extra ) {
