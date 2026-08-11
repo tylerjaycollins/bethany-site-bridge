@@ -1,0 +1,81 @@
+name: Release plugin zip
+
+# Tag a version (v0.7.0) and this builds the installable zip and attaches it to the
+# release, which is what manifest.json's "package" URL points at.
+#
+# ⚠️ The zip MUST contain a top-level folder named exactly `bethany-site-bridge/`.
+# WordPress uses that folder name to decide which installed plugin it is replacing.
+# GitHub's auto-generated source zip names its folder `<repo>-<tag>/`, which WP would
+# treat as a DIFFERENT plugin and install alongside the old one instead of updating it.
+# That's why we build the archive by hand here rather than using the zipball URL.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the plugin header and the manifest
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          HEADER=$(grep -m1 -E '^\s*\*\s*Version:' bethany-site-bridge.php | sed -E 's/.*Version:[[:space:]]*//' | tr -d '[:space:]')
+          MANIFEST=$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")
+          echo "tag=$TAG header=$HEADER manifest=$MANIFEST"
+          # A mismatch here is the failure mode that silently ships a stale build, or
+          # advertises a version whose zip doesn't exist. Fail loudly instead.
+          [ "$TAG" = "$HEADER" ]   || { echo "::error::tag $TAG != plugin header $HEADER"; exit 1; }
+          [ "$TAG" = "$MANIFEST" ] || { echo "::error::tag $TAG != manifest $MANIFEST"; exit 1; }
+
+      - name: Check the manifest package URL points at THIS tag
+        run: |
+          set -euo pipefail
+          URL=$(python3 -c "import json;print(json.load(open('manifest.json'))['package'])")
+          echo "$URL"
+          case "$URL" in
+            *"/download/${GITHUB_REF_NAME}/bethany-site-bridge.zip") ;;
+            *) echo "::error::manifest package URL does not point at ${GITHUB_REF_NAME}"; exit 1 ;;
+          esac
+
+      - name: Build the zip with the correct folder name
+        run: |
+          set -euo pipefail
+          mkdir -p build/bethany-site-bridge
+          cp bethany-site-bridge.php build/bethany-site-bridge/
+          cd build && zip -rq ../bethany-site-bridge.zip bethany-site-bridge
+          cd .. && unzip -l bethany-site-bridge.zip
+
+      - name: Verify the zip's top-level folder
+        run: |
+          set -euo pipefail
+          TOP=$(unzip -Z1 bethany-site-bridge.zip | head -1 | cut -d/ -f1)
+          [ "$TOP" = "bethany-site-bridge" ] || { echo "::error::top-level folder is '$TOP'"; exit 1; }
+          unzip -Z1 bethany-site-bridge.zip | grep -qx 'bethany-site-bridge/bethany-site-bridge.php'
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES=$(python3 - <<'PY'
+          import json, re, html
+          m = json.load(open('manifest.json'))
+          cl = m.get('sections', {}).get('changelog', '')
+          # Take just the newest <h4> block and flatten it to markdown-ish text.
+          blocks = re.split(r'<h4>', cl)
+          newest = blocks[1] if len(blocks) > 1 else cl
+          text = re.sub(r'<li>', '\n- ', newest)
+          text = re.sub(r'<[^>]+>', '', text)
+          print(html.unescape(text).strip())
+          PY
+          )
+          gh release create "$GITHUB_REF_NAME" bethany-site-bridge.zip \
+            --title "$GITHUB_REF_NAME" --notes "$NOTES"
