@@ -23,6 +23,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # THE most important step here. This plugin is ACTIVE on the live site, so a PHP
+      # syntax error in a release would white-screen bethanycentral.org — and that risk
+      # is real because the plugin is authored in an environment with no PHP available
+      # to lint with (checks there are hand-done bracket/string balance passes).
+      # The runner has PHP, so a syntax error can never reach a release from here.
+      # Do not remove this: auto-updates are only safe because this gate exists.
+      - name: Lint PHP (blocks a white-screen release)
+        run: |
+          set -euo pipefail
+          php -v | head -1
+          php -l bethany-site-bridge.php
+          # A trailing close tag can emit stray whitespace before headers.
+          if grep -q '?>' bethany-site-bridge.php; then
+            echo "::error::plugin contains a closing ?> tag — remove it"; exit 1
+          fi
+
       - name: Check the tag matches the plugin header and the manifest
         run: |
           set -euo pipefail
