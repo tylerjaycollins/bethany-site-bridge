@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.9.0
+ * Version:     0.9.1
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -33,8 +33,10 @@
  *             so it ships through this plugin's one-click update instead of being
  *             hand-edited in wp-admin: trip-update nested URLs (snippet #5), trip
  *             breadcrumbs (#6), [ff_date] shortcode (#7), and the Atlas GF poke (#8).
- *             The poke needs ATLAS_GF_POKE_TOKEN defined in wp-config.php — the
- *             token VALUE stays out of this file because the repo is public. Every
+ *             The poke token comes from the ATLAS_GF_POKE_TOKEN constant
+ *             (wp-config.php or theme functions.php), or from a WP option set via
+ *             PUT /site/gf-poke-token (v0.9.1) when no file access is available —
+ *             the token VALUE stays out of this file because the repo is public. Every
  *             function is function_exists()-guarded so the plugin and the old
  *             snippets can overlap during cutover; deactivate the snippets after
  *             updating.
@@ -61,6 +63,7 @@
  * ENDPOINTS (base <site>/wp-json/atlas/v1)
  *   GET  /site                      → environment + capability report
  *   POST /site/check-updates        → force core's plugin update check (see below)
+ *   PUT  /site/gf-poke-token        → store the GF poke token as a WP option
  *   GET  /meta/{ref}                → post meta (all, or ?keys=a,b)
  *   PUT  /meta/{ref}                → write meta. Requires confirm=true.
  *   GET  /events/{ref}/recurrence   → raw _EventRecurrence + occurrence list
@@ -113,6 +116,9 @@ add_action( 'rest_api_init', function () {
 	) );
 	register_rest_route( 'atlas/v1', '/site/check-updates', array(
 		array( 'methods' => 'POST', 'callback' => 'bsb_site_check_updates', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/site/gf-poke-token', array(
+		array( 'methods' => 'PUT', 'callback' => 'bsb_site_put_gf_poke_token', 'permission_callback' => $auth ),
 	) );
 
 	// --- meta ---
@@ -173,8 +179,8 @@ add_action( 'admin_notices', function () {
 	if ( ! function_exists( 'tribe_create_event' ) ) {
 		$problems[] = 'The Events Calendar is not active — the events module\'s reads work, writes return 501.';
 	}
-	if ( ! defined( 'ATLAS_GF_POKE_TOKEN' ) || ATLAS_GF_POKE_TOKEN === '' ) {
-		$problems[] = 'no <code>ATLAS_GF_POKE_TOKEN</code> in <code>wp-config.php</code> — the Gravity Forms → Atlas poke is disabled, so the GF → Sheets sync falls back to its daily cron.';
+	if ( bsb_gf_poke_token() === '' ) {
+		$problems[] = 'no GF poke token — define <code>ATLAS_GF_POKE_TOKEN</code> or set it via <code>PUT /site/gf-poke-token</code>. Until then the Gravity Forms → Atlas poke is disabled and the GF → Sheets sync falls back to its daily cron.';
 	}
 	if ( ! $problems ) {
 		return;
@@ -597,6 +603,10 @@ function bsb_site_report( WP_REST_Request $req ) {
 			'version'        => bsb_installed_version(),
 			'secret_defined' => bsb_secret() !== '',
 			'modules'        => array( 'site', 'meta', 'events', 'tweaks', 'updater' ),
+			// Where the GF poke token is coming from — never the value itself.
+			'gf_poke_token'  => ( defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '' )
+				? 'constant'
+				: ( get_option( 'bsb_gf_poke_token', '' ) !== '' ? 'option' : null ),
 			// ?refresh_update=1 bypasses the 6h manifest cache.
 			'update'         => bsb_update_status(
 				filter_var( $req->get_param( 'refresh_update' ), FILTER_VALIDATE_BOOLEAN )
@@ -1409,19 +1419,69 @@ function bsb_events_put_recurrence( WP_REST_Request $req ) {
  * connection, so this code never needs editing when connections change.
  * Non-blocking with a 2s cap — a form submission never waits on Atlas.
  *
- * The token lives in wp-config.php (define( 'ATLAS_GF_POKE_TOKEN', '…' );),
- * NEVER in this file — the distribution repo is public. Without the constant
- * the poke is skipped and the admin notice says so; the sync still runs on
- * Atlas's daily cron, just not instantly.
+ * The token is NEVER in this file — the distribution repo is public. It comes
+ * from the ATLAS_GF_POKE_TOKEN constant (wp-config.php or theme functions.php),
+ * or from the bsb_gf_poke_token option, set over authenticated REST for hosts
+ * where no file access is available (the constant wins if both exist). Without
+ * either, the poke is skipped and the admin notice says so; the sync still
+ * runs on Atlas's daily cron, just not instantly.
  */
+
+/** The poke token: constant wins, then the option set via PUT /site/gf-poke-token. */
+if ( ! function_exists( 'bsb_gf_poke_token' ) ) {
+	function bsb_gf_poke_token() {
+		if ( defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '' ) {
+			return (string) ATLAS_GF_POKE_TOKEN;
+		}
+		return (string) get_option( 'bsb_gf_poke_token', '' );
+	}
+}
+
+/**
+ * PUT /site/gf-poke-token — store the poke token as a WP option.
+ *
+ * Exists because this site's Theme File Editor can't save (its loopback fatal-check
+ * is blocked by the firewall in front of the site) and wp-config needs SFTP. Takes
+ * confirm=true like the other write endpoints; never echoes the token back.
+ */
+function bsb_site_put_gf_poke_token( WP_REST_Request $req ) {
+	$token = (string) $req->get_param( 'token' );
+	if ( $token === '' ) {
+		return new WP_Error( 'bsb_no_token', 'A non-empty "token" is required', array( 'status' => 400 ) );
+	}
+	$constant_set = defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '';
+	$option_set   = get_option( 'bsb_gf_poke_token', '' ) !== '';
+
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array(
+			'dry_run'           => true,
+			'note'              => 'confirm=true was not passed — nothing written',
+			'currently_set_via' => $constant_set ? 'constant' : ( $option_set ? 'option' : null ),
+			'token_length'      => strlen( $token ),
+		) );
+	}
+
+	update_option( 'bsb_gf_poke_token', $token, false ); // no autoload — only read on GF submits
+
+	return rest_ensure_response( array(
+		'updated'      => true,
+		'set_via'      => 'option',
+		'token_length' => strlen( $token ),
+		'note'         => $constant_set
+			? 'ATLAS_GF_POKE_TOKEN is also defined and SHADOWS this option — the constant is what the poke will send.'
+			: null,
+	) );
+}
+
 if ( ! function_exists( 'bsb_gf_atlas_poke' ) ) {
 	function bsb_gf_atlas_poke( $entry, $form ) {
 		unset( $entry );
-		if ( ! defined( 'ATLAS_GF_POKE_TOKEN' ) || ATLAS_GF_POKE_TOKEN === '' ) {
+		$token = bsb_gf_poke_token();
+		if ( $token === '' ) {
 			return;
 		}
 		wp_remote_post(
-			'https://atlas.bethanycentral.org/api/webhooks/gf?token=' . rawurlencode( ATLAS_GF_POKE_TOKEN ),
+			'https://atlas.bethanycentral.org/api/webhooks/gf?token=' . rawurlencode( $token ),
 			array(
 				'timeout'  => 2,
 				'blocking' => false,
