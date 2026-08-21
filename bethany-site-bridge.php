@@ -4,8 +4,9 @@
  * Description: A working surface for making bethanycentral.org changes over REST —
  *              site introspection, arbitrary post meta, and The Events Calendar
  *              recurrence (including "will not occur" dates), none of which core
- *              or plugin REST APIs expose. Consumed by Atlas and by Claude Code.
- * Version:     0.8.1
+ *              or plugin REST APIs expose — plus the site's custom PHP tweaks
+ *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
+ * Version:     0.9.0
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -28,6 +29,15 @@
  *   meta    — read/write arbitrary post meta. The escape hatch for ACF fields and
  *             plugin meta that isn't in any REST whitelist.
  *   events  — The Events Calendar RECURRING events + "will not occur" exclusions.
+ *   tweaks  — the site's custom PHP, absorbed from the Code Snippets plugin (v0.9.0)
+ *             so it ships through this plugin's one-click update instead of being
+ *             hand-edited in wp-admin: trip-update nested URLs (snippet #5), trip
+ *             breadcrumbs (#6), [ff_date] shortcode (#7), and the Atlas GF poke (#8).
+ *             The poke needs ATLAS_GF_POKE_TOKEN defined in wp-config.php — the
+ *             token VALUE stays out of this file because the repo is public. Every
+ *             function is function_exists()-guarded so the plugin and the old
+ *             snippets can overlap during cutover; deactivate the snippets after
+ *             updating.
  *
  * INSTALL — plugin zip, no SFTP or theme-file-editor needed
  *   1. Build:  mkdir -p /tmp/pkg/bethany-site-bridge
@@ -162,6 +172,9 @@ add_action( 'admin_notices', function () {
 	}
 	if ( ! function_exists( 'tribe_create_event' ) ) {
 		$problems[] = 'The Events Calendar is not active — the events module\'s reads work, writes return 501.';
+	}
+	if ( ! defined( 'ATLAS_GF_POKE_TOKEN' ) || ATLAS_GF_POKE_TOKEN === '' ) {
+		$problems[] = 'no <code>ATLAS_GF_POKE_TOKEN</code> in <code>wp-config.php</code> — the Gravity Forms → Atlas poke is disabled, so the GF → Sheets sync falls back to its daily cron.';
 	}
 	if ( ! $problems ) {
 		return;
@@ -583,7 +596,7 @@ function bsb_site_report( WP_REST_Request $req ) {
 		'bridge' => array(
 			'version'        => bsb_installed_version(),
 			'secret_defined' => bsb_secret() !== '',
-			'modules'        => array( 'site', 'meta', 'events', 'updater' ),
+			'modules'        => array( 'site', 'meta', 'events', 'tweaks', 'updater' ),
 			// ?refresh_update=1 bypasses the 6h manifest cache.
 			'update'         => bsb_update_status(
 				filter_var( $req->get_param( 'refresh_update' ), FILTER_VALIDATE_BOOLEAN )
@@ -1371,3 +1384,193 @@ function bsb_events_put_recurrence( WP_REST_Request $req ) {
 			: 'Occurrences had not matched the preview yet. TEC regenerates them after the write returns, so this is often just timing — re-check GET /events/' . get_post_field( 'post_name', $post_id ) . '/occurrences before assuming failure, and do NOT retry the write blindly.',
 	) );
 }
+
+/* ================================================================== *
+ * MODULE: tweaks — the site's custom PHP, absorbed from Code Snippets
+ * ================================================================== *
+ *
+ * Formerly Code Snippets #5–#8, moved here in v0.9.0 so changes ship through
+ * this plugin's one-click update instead of being hand-edited in wp-admin (the
+ * 2026-08 domain move meant editing a URL inside a live snippet — exactly the
+ * kind of change that should be a git commit + release).
+ *
+ * CUTOVER: every named function is function_exists()-guarded, so this plugin
+ * and the old snippets can be active at the same time without a fatal. While
+ * they overlap, the permalink/breadcrumb/shortcode hooks are idempotent and the
+ * GF poke fires twice (harmless — the second sync is a no-op). Deactivate
+ * snippets #5–#8 after updating; don't leave the overlap in place forever.
+ */
+
+/* ---------- Atlas GF poke (was snippet #8) ------------------------ *
+ *
+ * Poke Atlas on every Gravity Forms submission so the GF -> Google Sheets sync
+ * pulls new entries immediately (Atlas's daily cron catches anything missed).
+ * Dumb on purpose: fires for every form; Atlas ignores forms with no active
+ * connection, so this code never needs editing when connections change.
+ * Non-blocking with a 2s cap — a form submission never waits on Atlas.
+ *
+ * The token lives in wp-config.php (define( 'ATLAS_GF_POKE_TOKEN', '…' );),
+ * NEVER in this file — the distribution repo is public. Without the constant
+ * the poke is skipped and the admin notice says so; the sync still runs on
+ * Atlas's daily cron, just not instantly.
+ */
+if ( ! function_exists( 'bsb_gf_atlas_poke' ) ) {
+	function bsb_gf_atlas_poke( $entry, $form ) {
+		unset( $entry );
+		if ( ! defined( 'ATLAS_GF_POKE_TOKEN' ) || ATLAS_GF_POKE_TOKEN === '' ) {
+			return;
+		}
+		wp_remote_post(
+			'https://atlas.bethanycentral.org/api/webhooks/gf?token=' . rawurlencode( ATLAS_GF_POKE_TOKEN ),
+			array(
+				'timeout'  => 2,
+				'blocking' => false,
+				'body'     => array( 'form_id' => isset( $form['id'] ) ? $form['id'] : 0 ),
+			)
+		);
+	}
+}
+add_action( 'gform_after_submission', 'bsb_gf_atlas_poke', 10, 2 );
+
+/* ---------- Nest trip-update URLs under their trip (was snippet #5) *
+ *
+ * Turns   /trip-update/<update-slug>
+ * into    /short-term-trips/<trip-slug>/<update-slug>
+ *
+ * Scoped under the /short-term-trips/ base + two path segments, so it can't
+ * hijack pages or other URLs.
+ */
+
+// 1) Rewrite the permalink WordPress prints for a trip-update.
+if ( ! function_exists( 'bcc_trip_update_permalink' ) ) {
+	function bcc_trip_update_permalink( $link, $post ) {
+		if ( $post->post_type !== 'trip-update' ) {
+			return $link;
+		}
+		$trip_id = get_post_meta( $post->ID, 'associated_trip', true );
+		if ( ! $trip_id ) {
+			return $link; // no trip linked yet — leave the default /trip-update/ URL
+		}
+		$trip = get_post( $trip_id );
+		if ( ! $trip || $trip->post_type !== 'short-term-trips' ) {
+			return $link;
+		}
+		return home_url( user_trailingslashit( 'short-term-trips/' . $trip->post_name . '/' . $post->post_name ) );
+	}
+}
+add_filter( 'post_type_link', 'bcc_trip_update_permalink', 10, 2 );
+
+// 2) Teach WordPress to resolve that nested URL back to the trip-update.
+//    (Update slugs are unique per post type, so $matches[2] is enough to find it;
+//    $matches[1], the trip slug, is just for a readable URL.)
+if ( ! function_exists( 'bcc_trip_update_rewrite' ) ) {
+	function bcc_trip_update_rewrite() {
+		add_rewrite_rule(
+			'^short-term-trips/([^/]+)/([^/]+)/?$',
+			'index.php?trip-update=$matches[2]',
+			'top'
+		);
+	}
+}
+add_action( 'init', 'bcc_trip_update_rewrite' );
+
+/**
+ * One-time rewrite flush, replacing the "do a Permalinks > Save after install"
+ * step the snippet needed. Bump BSB_REWRITE_VERSION only when the rewrite rules
+ * above actually change — a flush on every load would be expensive.
+ */
+const BSB_REWRITE_VERSION = 1;
+add_action( 'init', function () {
+	if ( (int) get_option( 'bsb_rewrite_version', 0 ) !== BSB_REWRITE_VERSION ) {
+		flush_rewrite_rules();
+		update_option( 'bsb_rewrite_version', BSB_REWRITE_VERSION );
+	}
+}, 20 );
+
+/* ---------- Trip breadcrumbs (was snippet #6) ---------------------- *
+ *
+ * Themeco Pro `x_breadcrumbs_data` filter.
+ *
+ *  short-term-trips single:  Home > Outreach > Short Term Trips > [Trip]
+ *  trip-update single:       Home > Outreach > Short Term Trips > [Trip] > [Update]
+ *
+ * "Short Term Trips" links to the landing page /outreach/short-term-trips/.
+ * The [Trip] crumb links to that trip's own page (resolved from the update's
+ * ACF `associated_trip` field).
+ */
+if ( ! function_exists( 'bcc_trip_breadcrumbs' ) ) {
+	function bcc_trip_breadcrumbs( $crumbs, $args ) {
+		unset( $args );
+		if ( empty( $crumbs ) || ! is_singular( array( 'short-term-trips', 'trip-update' ) ) ) {
+			return $crumbs;
+		}
+
+		$home    = $crumbs[0];          // keep the existing Home crumb
+		$current = end( $crumbs );      // keep the existing current-page crumb
+
+		// The "Outreach" parent-section crumb.
+		$outreach = array(
+			'type'  => 'custom',
+			'url'   => home_url( '/outreach/' ),
+			'label' => 'Outreach',
+		);
+
+		// The "Short Term Trips" landing-page crumb.
+		$landing = array(
+			'type'  => 'custom',
+			'url'   => home_url( '/outreach/short-term-trips/' ),
+			'label' => 'Short Term Trips',
+		);
+
+		// A trip single: Home > Outreach > Short Term Trips > [this trip]
+		if ( is_singular( 'short-term-trips' ) ) {
+			return array( $home, $outreach, $landing, $current );
+		}
+
+		// A trip update: Home > Outreach > Short Term Trips > [parent trip] > [this update]
+		$trail   = array( $home, $outreach, $landing );
+		$trip_id = get_post_meta( get_queried_object_id(), 'associated_trip', true );
+		if ( $trip_id ) {
+			$trail[] = array(
+				'type'  => 'short-term-trips',
+				'url'   => get_permalink( $trip_id ),
+				'label' => get_the_title( $trip_id ),
+			);
+		}
+		$trail[] = $current;
+		return $trail;
+	}
+}
+add_filter( 'x_breadcrumbs_data', 'bcc_trip_breadcrumbs', 10, 2 );
+
+/* ---------- [ff_date] Fall Festival shortcode (was snippet #7) ----- *
+ *
+ * Fall Festival date, computed as the LAST Saturday of September. Shows this
+ * year's date until the festival has passed, then next year's.
+ *   [ff_date]                -> September 26th
+ *   [ff_date format="full"]  -> Saturday, September 26th
+ * Used on /fallfestival (page 26967).
+ */
+if ( ! function_exists( 'bsb_ff_date_shortcode' ) ) {
+	function bsb_ff_date_shortcode( $atts ) {
+		$atts = shortcode_atts( array( 'format' => 'short' ), $atts, 'ff_date' );
+		$tz   = wp_timezone();
+		$now  = new DateTimeImmutable( 'now', $tz );
+		$year = (int) $now->format( 'Y' );
+		$ff   = new DateTimeImmutable( 'last saturday of september ' . $year, $tz );
+		if ( $now > $ff->setTime( 23, 59, 59 ) ) {
+			$ff = new DateTimeImmutable( 'last saturday of september ' . ( $year + 1 ), $tz );
+		}
+		$day    = (int) $ff->format( 'j' );
+		$suffix = 'th';
+		if ( ! in_array( $day % 100, array( 11, 12, 13 ), true ) ) {
+			$map = array( 1 => 'st', 2 => 'nd', 3 => 'rd' );
+			if ( isset( $map[ $day % 10 ] ) ) {
+				$suffix = $map[ $day % 10 ];
+			}
+		}
+		$base = $ff->format( 'F' ) . ' ' . $day . $suffix;
+		return 'full' === $atts['format'] ? $ff->format( 'l' ) . ', ' . $base : $base;
+	}
+}
+add_shortcode( 'ff_date', 'bsb_ff_date_shortcode' );
