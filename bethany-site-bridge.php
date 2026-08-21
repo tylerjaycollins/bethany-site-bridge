@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.9.1
+ * Version:     0.9.2
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -606,7 +606,7 @@ function bsb_site_report( WP_REST_Request $req ) {
 			// Where the GF poke token is coming from — never the value itself.
 			'gf_poke_token'  => ( defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '' )
 				? 'constant'
-				: ( get_option( 'bsb_gf_poke_token', '' ) !== '' ? 'option' : null ),
+				: ( bsb_option_read( 'bsb_gf_poke_token' ) !== '' ? 'option' : null ),
 			// ?refresh_update=1 bypasses the 6h manifest cache.
 			'update'         => bsb_update_status(
 				filter_var( $req->get_param( 'refresh_update' ), FILTER_VALIDATE_BOOLEAN )
@@ -1427,13 +1427,61 @@ function bsb_events_put_recurrence( WP_REST_Request $req ) {
  * runs on Atlas's daily cron, just not instantly.
  */
 
+/**
+ * Option read/write hardened against this host's persistent object cache.
+ *
+ * Observed 2026-08-21 (v0.9.1): update_option() reported success but every
+ * later request read the option as missing. The "notoptions" negative-lookup
+ * cache had been populated by earlier reads (the admin notice checks for the
+ * token on every admin page), and the cleanup add_option() performs wasn't
+ * propagating through the host's persistent object cache. So: writes go
+ * through update_option() and are then VERIFIED against the database row
+ * directly, with a raw upsert as the fallback; reads fall back to the
+ * database whenever the cache says "missing", healing the cache when the row
+ * turns out to exist. Values are plain strings — no serialization needed.
+ */
+function bsb_option_read( $name ) {
+	$v = get_option( $name, '' );
+	if ( $v !== '' && $v !== false ) {
+		return (string) $v;
+	}
+	global $wpdb;
+	$row = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $name ) );
+	if ( $row !== null && $row !== '' ) {
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_set( $name, $row, 'options' );
+		return (string) $row;
+	}
+	return '';
+}
+
+/** Returns true only when the database row verifiably holds $value. */
+function bsb_option_write( $name, $value ) {
+	global $wpdb;
+	wp_cache_delete( 'notoptions', 'options' );
+	wp_cache_delete( $name, 'options' );
+	update_option( $name, $value, false );
+	$row = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $name ) );
+	if ( $row !== (string) $value ) {
+		$wpdb->query( $wpdb->prepare(
+			"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')
+			 ON DUPLICATE KEY UPDATE option_value = VALUES(option_value)",
+			$name, $value
+		) );
+		$row = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $name ) );
+	}
+	wp_cache_delete( 'notoptions', 'options' );
+	wp_cache_delete( $name, 'options' );
+	return $row === (string) $value;
+}
+
 /** The poke token: constant wins, then the option set via PUT /site/gf-poke-token. */
 if ( ! function_exists( 'bsb_gf_poke_token' ) ) {
 	function bsb_gf_poke_token() {
 		if ( defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '' ) {
 			return (string) ATLAS_GF_POKE_TOKEN;
 		}
-		return (string) get_option( 'bsb_gf_poke_token', '' );
+		return bsb_option_read( 'bsb_gf_poke_token' );
 	}
 }
 
@@ -1450,7 +1498,7 @@ function bsb_site_put_gf_poke_token( WP_REST_Request $req ) {
 		return new WP_Error( 'bsb_no_token', 'A non-empty "token" is required', array( 'status' => 400 ) );
 	}
 	$constant_set = defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '';
-	$option_set   = get_option( 'bsb_gf_poke_token', '' ) !== '';
+	$option_set   = bsb_option_read( 'bsb_gf_poke_token' ) !== '';
 
 	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
 		return rest_ensure_response( array(
@@ -1461,11 +1509,17 @@ function bsb_site_put_gf_poke_token( WP_REST_Request $req ) {
 		) );
 	}
 
-	update_option( 'bsb_gf_poke_token', $token, false ); // no autoload — only read on GF submits
+	// DB-verified write — v0.9.1's plain update_option() "succeeded" while the
+	// row never became readable (see bsb_option_write for the whole story).
+	$persisted = bsb_option_write( 'bsb_gf_poke_token', $token );
+	if ( ! $persisted ) {
+		return new WP_Error( 'bsb_write_failed', 'The option row does not hold the value after writing — the token is NOT set.', array( 'status' => 500 ) );
+	}
 
 	return rest_ensure_response( array(
 		'updated'      => true,
 		'set_via'      => 'option',
+		'persisted'    => true, // verified against the DB row, not update_option's return
 		'token_length' => strlen( $token ),
 		'note'         => $constant_set
 			? 'ATLAS_GF_POKE_TOKEN is also defined and SHADOWS this option — the constant is what the poke will send.'
@@ -1541,9 +1595,12 @@ add_action( 'init', 'bcc_trip_update_rewrite' );
  */
 const BSB_REWRITE_VERSION = 1;
 add_action( 'init', function () {
-	if ( (int) get_option( 'bsb_rewrite_version', 0 ) !== BSB_REWRITE_VERSION ) {
+	// Hardened read/write (bsb_option_read/write): with plain get_option this
+	// site's poisoned notoptions cache made the guard read 0 forever, which
+	// would mean a full rewrite flush on EVERY request.
+	if ( (int) bsb_option_read( 'bsb_rewrite_version' ) !== BSB_REWRITE_VERSION ) {
 		flush_rewrite_rules();
-		update_option( 'bsb_rewrite_version', BSB_REWRITE_VERSION );
+		bsb_option_write( 'bsb_rewrite_version', (string) BSB_REWRITE_VERSION );
 	}
 }, 20 );
 
