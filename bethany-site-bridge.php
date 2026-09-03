@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.9.2
+ * Version:     0.9.3
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -29,6 +29,8 @@
  *   meta    — read/write arbitrary post meta. The escape hatch for ACF fields and
  *             plugin meta that isn't in any REST whitelist.
  *   events  — The Events Calendar RECURRING events + "will not occur" exclusions.
+ *   redirects — path → URL redirects managed over REST (legacy URLs after a
+ *             page move; the nested paths WordPress's own 404 guess can't rescue).
  *   tweaks  — the site's custom PHP, absorbed from the Code Snippets plugin (v0.9.0)
  *             so it ships through this plugin's one-click update instead of being
  *             hand-edited in wp-admin: trip-update nested URLs (snippet #5), trip
@@ -70,6 +72,9 @@
  *   GET  /events/{ref}/occurrences  → every generated date for the series
  *   POST /events                    → create (optionally recurring). dry_run ok.
  *   PUT  /events/{ref}/recurrence   → replace rule + exclusions. dry_run ok.
+ *   GET  /redirects                 → every rule (+ ?resolve=/some/path to test one)
+ *   PUT  /redirects                 → add/replace a rule {path,to,status,note}. confirm=true.
+ *   DELETE /redirects               → remove a rule {path}. confirm=true.
  *
  * {ref} = post ID, TEC provisional occurrence ID, or slug. Prefer the SLUG.
  *
@@ -137,6 +142,13 @@ add_action( 'rest_api_init', function () {
 	) );
 	register_rest_route( 'atlas/v1', '/events/(?P<ref>[^/]+)/occurrences', array(
 		array( 'methods' => 'GET', 'callback' => 'bsb_events_get_occurrences', 'permission_callback' => $auth ),
+	) );
+
+	// --- redirects ---
+	register_rest_route( 'atlas/v1', '/redirects', array(
+		array( 'methods' => 'GET',    'callback' => 'bsb_redirects_list',   'permission_callback' => $auth ),
+		array( 'methods' => 'PUT',    'callback' => 'bsb_redirects_put',    'permission_callback' => $auth ),
+		array( 'methods' => 'DELETE', 'callback' => 'bsb_redirects_delete', 'permission_callback' => $auth ),
 	) );
 } );
 
@@ -602,7 +614,8 @@ function bsb_site_report( WP_REST_Request $req ) {
 		'bridge' => array(
 			'version'        => bsb_installed_version(),
 			'secret_defined' => bsb_secret() !== '',
-			'modules'        => array( 'site', 'meta', 'events', 'tweaks', 'updater' ),
+			'modules'        => array( 'site', 'meta', 'events', 'redirects', 'tweaks', 'updater' ),
+			'redirect_rules' => count( bsb_redirects_all() ),
 			// Where the GF poke token is coming from — never the value itself.
 			'gf_poke_token'  => ( defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '' )
 				? 'constant'
@@ -1393,6 +1406,295 @@ function bsb_events_put_recurrence( WP_REST_Request $req ) {
 			? null
 			: 'Occurrences had not matched the preview yet. TEC regenerates them after the write returns, so this is often just timing — re-check GET /events/' . get_post_field( 'post_name', $post_id ) . '/occurrences before assuming failure, and do NOT retry the write blindly.',
 	) );
+}
+
+/* ================================================================== *
+ * MODULE: redirects — path → URL redirects, managed over REST
+ * ================================================================== *
+ *
+ * Added 2026-09-03 for /contact/email-preferences. The Contact page moved under
+ * About on 2025-05-30 and its child moved with it; WordPress's own 404 guess
+ * rescues the bare /contact/ but never a nested path, so the child's old URL
+ * went dead in every email footer that carried it. Nothing on the site could add
+ * that redirect over REST — the Pretty Links mu-plugin bridge sanitize_title()s
+ * the slashes out of a slug, and Quick Page/Post Redirect is wp-admin only — so
+ * this module is that hatch. It is deliberately independent of both plugins.
+ *
+ * STORAGE — one option, `bsb_redirects`, a JSON object keyed by normalized path:
+ *   "/contact/email-preferences": { "to": "/about/contact/email-preferences",
+ *                                   "status": 301, "note": "...", "updated": "..." }
+ * Written through bsb_option_write(), so the poisoned-notoptions-cache problem
+ * that bit 0.9.1 can't make a rule look saved when it isn't.
+ *
+ * MATCHING — paths are lower-cased, url-decoded, slash-collapsed, trailing slash
+ * dropped; the query string is ignored for matching and carried over to the
+ * destination when the destination has none. A key ending in "/*" is a PREFIX
+ * rule: "/contact/*" matches /contact/anything (children only, not /contact
+ * itself). Put "*" at the end of that rule's "to" to carry the remainder along
+ * ("/about/contact/*"); without it the whole subtree lands on one URL. Exact
+ * rules win over prefix rules; a longer prefix wins over a shorter one.
+ *
+ * SERVING — template_redirect at priority 0, so a rule wins over a real page at
+ * the same path (that is what an explicit redirect means; PUT reports it as
+ * `shadows` so it's never a surprise). Cost on an unmatched request is one
+ * option read. A rule that would send a request to itself is refused on write
+ * and skipped on serve, so a typo can't loop the site.
+ */
+
+const BSB_REDIRECTS_OPTION = 'bsb_redirects';
+
+/** "/Contact//Email-Preferences/?x=1" → "/contact/email-preferences"; keeps a trailing "/*". */
+function bsb_redirects_normalize_path( $path ) {
+	$path = (string) $path;
+	$p    = parse_url( $path, PHP_URL_PATH );
+	if ( ! is_string( $p ) ) {
+		$p = $path;
+	}
+	$p    = strtolower( rawurldecode( $p ) );
+	$wild = substr( $p, -2 ) === '/*';
+	if ( $wild ) {
+		$p = substr( $p, 0, -2 );
+	}
+	$p = '/' . trim( preg_replace( '#/+#', '/', $p ), '/' );
+	return $wild ? rtrim( $p, '/' ) . '/*' : $p;
+}
+
+/** Every rule, keyed by normalized path. Cached per request; $reload after a write. */
+function bsb_redirects_all( $reload = false ) {
+	static $cache = null;
+	if ( is_array( $cache ) && ! $reload ) {
+		return $cache;
+	}
+	$raw   = bsb_option_read( BSB_REDIRECTS_OPTION );
+	$data  = $raw !== '' ? json_decode( $raw, true ) : array();
+	$cache = is_array( $data ) ? $data : array();
+	return $cache;
+}
+
+/** DB-verified save of the whole rule set. */
+function bsb_redirects_save( array $rules ) {
+	ksort( $rules );
+	$json = wp_json_encode( $rules, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+	$ok   = bsb_option_write( BSB_REDIRECTS_OPTION, $json );
+	bsb_redirects_all( true );
+	return $ok;
+}
+
+/**
+ * The rule that applies to $path, or null. Returns the matched key, the resolved
+ * "to" (prefix remainder already substituted) and the status.
+ */
+function bsb_redirects_resolve( $path ) {
+	$rules = bsb_redirects_all();
+	$path  = bsb_redirects_normalize_path( $path );
+
+	if ( isset( $rules[ $path ] ) && substr( $path, -2 ) !== '/*' ) {
+		$r = $rules[ $path ];
+		return array( 'rule' => $path, 'to' => (string) $r['to'], 'status' => (int) $r['status'] );
+	}
+
+	$best = null;
+	foreach ( $rules as $key => $r ) {
+		if ( substr( $key, -2 ) !== '/*' ) {
+			continue;
+		}
+		$prefix = substr( $key, 0, -1 ); // "/contact/*" → "/contact/"
+		if ( strpos( $path, $prefix ) === 0 && ( $best === null || strlen( $key ) > strlen( $best ) ) ) {
+			$best = $key;
+		}
+	}
+	if ( $best === null ) {
+		return null;
+	}
+	$r         = $rules[ $best ];
+	$remainder = substr( $path, strlen( $best ) - 1 ); // what followed the prefix
+	$to        = (string) $r['to'];
+	$star      = strrpos( $to, '*' );
+	if ( $star !== false ) {
+		$to = substr( $to, 0, $star ) . $remainder . substr( $to, $star + 1 );
+	}
+	return array( 'rule' => $best, 'to' => $to, 'status' => (int) $r['status'] );
+}
+
+/** Absolute destination: site-relative "to" gets home_url(); the request's query rides along. */
+function bsb_redirects_target_url( $to, $request_query = '' ) {
+	if ( isset( $to[0] ) && $to[0] === '/' ) {
+		$to = home_url( $to );
+	}
+	if ( $request_query !== '' && strpos( $to, '?' ) === false ) {
+		$to .= '?' . $request_query;
+	}
+	return $to;
+}
+
+/** True when $target is this site at the same normalized path — i.e. a loop. */
+function bsb_redirects_is_self( $target, $path ) {
+	$t_host = strtolower( (string) parse_url( $target, PHP_URL_HOST ) );
+	$here   = strtolower( (string) parse_url( home_url( '/' ), PHP_URL_HOST ) );
+	if ( $t_host !== '' && $t_host !== $here ) {
+		return false;
+	}
+	return bsb_redirects_normalize_path( (string) parse_url( $target, PHP_URL_PATH ) ) === bsb_redirects_normalize_path( $path );
+}
+
+/** The front-end hook. */
+function bsb_redirects_serve() {
+	if ( empty( $_SERVER['REQUEST_URI'] ) || ! bsb_redirects_all() ) {
+		return;
+	}
+	$uri   = (string) wp_unslash( $_SERVER['REQUEST_URI'] );
+	$path  = (string) parse_url( $uri, PHP_URL_PATH );
+	$query = (string) parse_url( $uri, PHP_URL_QUERY );
+
+	// A site installed in a subdirectory carries that prefix on every request.
+	$home_path = rtrim( (string) parse_url( home_url( '/' ), PHP_URL_PATH ), '/' );
+	if ( $home_path !== '' && strpos( $path, $home_path ) === 0 ) {
+		$path = substr( $path, strlen( $home_path ) );
+	}
+
+	$hit = bsb_redirects_resolve( $path );
+	if ( ! $hit ) {
+		return;
+	}
+	$target = bsb_redirects_target_url( $hit['to'], $query );
+	if ( bsb_redirects_is_self( $target, $path ) ) {
+		return;
+	}
+	nocache_headers();
+	wp_redirect( $target, $hit['status'], 'Bethany Site Bridge' );
+	exit;
+}
+add_action( 'template_redirect', 'bsb_redirects_serve', 0 );
+
+/** The post a rule would shadow (a real page at that path), or null. Prefix rules probe the parent. */
+function bsb_redirects_shadows( $path ) {
+	$probe = substr( $path, -2 ) === '/*' ? substr( $path, 0, -2 ) : $path;
+	if ( $probe === '' || $probe === '/' ) {
+		return null;
+	}
+	$id = url_to_postid( home_url( $probe ) );
+	if ( ! $id ) {
+		return null;
+	}
+	return array( 'id' => $id, 'title' => get_the_title( $id ), 'link' => get_permalink( $id ) );
+}
+
+/** Validate + normalize a rule. Returns array( path, to, status, shadows ) or WP_Error. */
+function bsb_redirects_validate( $path, $to, $status ) {
+	$path = trim( (string) $path );
+	if ( $path === '' || $path[0] !== '/' ) {
+		return new WP_Error( 'bsb_bad_path', '"path" must be site-relative and start with "/", e.g. /old/page or /old/* for a prefix — not a full URL', array( 'status' => 400 ) );
+	}
+	$path = bsb_redirects_normalize_path( $path );
+	if ( $path === '/' || $path === '/*' ) {
+		return new WP_Error( 'bsb_bad_path', 'Refusing a rule for the site root — that would redirect every request', array( 'status' => 400 ) );
+	}
+
+	$to = trim( (string) $to );
+	if ( $to === '' || ! ( $to[0] === '/' || preg_match( '#^https?://#i', $to ) ) ) {
+		return new WP_Error( 'bsb_bad_to', '"to" must be an absolute http(s) URL or a site-relative path starting with "/"', array( 'status' => 400 ) );
+	}
+	$to = esc_url_raw( $to );
+	if ( $to === '' ) {
+		return new WP_Error( 'bsb_bad_to', '"to" did not survive URL sanitization', array( 'status' => 400 ) );
+	}
+
+	$status = $status === null || $status === '' ? 301 : (int) $status;
+	if ( ! in_array( $status, array( 301, 302, 307, 308 ), true ) ) {
+		return new WP_Error( 'bsb_bad_status', '"status" must be 301, 302, 307 or 308', array( 'status' => 400 ) );
+	}
+
+	$probe = substr( $path, -2 ) === '/*' ? substr( $path, 0, -2 ) . '/x' : $path;
+	if ( bsb_redirects_is_self( bsb_redirects_target_url( str_replace( '*', 'x', $to ) ), $probe ) ) {
+		return new WP_Error( 'bsb_self_redirect', 'That rule would redirect the path to itself', array( 'status' => 400 ) );
+	}
+
+	return array( 'path' => $path, 'to' => $to, 'status' => $status, 'shadows' => bsb_redirects_shadows( $path ) );
+}
+
+/** GET /redirects — every rule; ?resolve=/some/path also reports what that path would do. */
+function bsb_redirects_list( WP_REST_Request $req ) {
+	$rules = bsb_redirects_all( true );
+	$out   = array();
+	foreach ( $rules as $path => $r ) {
+		$out[] = array_merge( array( 'path' => $path ), $r );
+	}
+	$resp = array( 'count' => count( $out ), 'rules' => $out );
+
+	$probe = $req->get_param( 'resolve' );
+	if ( $probe !== null && $probe !== '' ) {
+		$hit = bsb_redirects_resolve( (string) $probe );
+		$resp['resolve'] = array(
+			'path'   => bsb_redirects_normalize_path( (string) $probe ),
+			'match'  => $hit,
+			'target' => $hit ? bsb_redirects_target_url( $hit['to'] ) : null,
+		);
+	}
+	return rest_ensure_response( $resp );
+}
+
+/** PUT /redirects {path, to, status?, note?, confirm} — add or replace one rule. */
+function bsb_redirects_put( WP_REST_Request $req ) {
+	$v = bsb_redirects_validate( $req->get_param( 'path' ), $req->get_param( 'to' ), $req->get_param( 'status' ) );
+	if ( is_wp_error( $v ) ) {
+		return $v;
+	}
+	$rules  = bsb_redirects_all( true );
+	$before = isset( $rules[ $v['path'] ] ) ? $rules[ $v['path'] ] : null;
+	$note   = $req->get_param( 'note' );
+	$rule   = array(
+		'to'      => $v['to'],
+		'status'  => $v['status'],
+		'note'    => $note !== null ? sanitize_text_field( (string) $note ) : ( $before ? (string) $before['note'] : '' ),
+		'updated' => current_time( 'c' ),
+	);
+
+	// What a real request would do once the rule is in — computed against the
+	// candidate set, so the preview is the behaviour, not a restatement of the input.
+	$candidate = $rules;
+	$candidate[ $v['path'] ] = $rule;
+	$example_path = substr( $v['path'], -2 ) === '/*' ? substr( $v['path'], 0, -2 ) . '/example' : $v['path'];
+	$preview = array(
+		'path'    => $v['path'],
+		'before'  => $before,
+		'after'   => $rule,
+		'shadows' => $v['shadows'],
+		'example' => array( 'request' => home_url( $example_path ), 'redirects_to' => bsb_redirects_target_url( str_replace( '*', 'example', $v['to'] ) ) ),
+	);
+
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array_merge( array( 'dry_run' => true, 'note' => 'confirm=true was not passed — nothing written' ), $preview ) );
+	}
+
+	if ( ! bsb_redirects_save( $candidate ) ) {
+		return new WP_Error( 'bsb_write_failed', 'The option row does not hold the rule after writing — the redirect is NOT in place.', array( 'status' => 500 ) );
+	}
+	$live = bsb_redirects_resolve( $example_path );
+	return rest_ensure_response( array_merge( array( 'updated' => true, 'persisted' => true ), $preview, array(
+		'live' => array( 'request' => home_url( $example_path ), 'redirects_to' => $live ? bsb_redirects_target_url( $live['to'] ) : null, 'status' => $live ? $live['status'] : null ),
+	) ) );
+}
+
+/** DELETE /redirects {path, confirm} — remove one rule. */
+function bsb_redirects_delete( WP_REST_Request $req ) {
+	$path = trim( (string) $req->get_param( 'path' ) );
+	if ( $path === '' || $path[0] !== '/' ) {
+		return new WP_Error( 'bsb_bad_path', '"path" must be the rule\'s site-relative path, starting with "/"', array( 'status' => 400 ) );
+	}
+	$path  = bsb_redirects_normalize_path( $path );
+	$rules = bsb_redirects_all( true );
+	if ( ! isset( $rules[ $path ] ) ) {
+		return new WP_Error( 'bsb_not_found', 'No rule for ' . $path, array( 'status' => 404 ) );
+	}
+	$removed = $rules[ $path ];
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array( 'dry_run' => true, 'note' => 'confirm=true was not passed — nothing removed', 'path' => $path, 'rule' => $removed ) );
+	}
+	unset( $rules[ $path ] );
+	if ( ! bsb_redirects_save( $rules ) ) {
+		return new WP_Error( 'bsb_write_failed', 'The option row still holds the rule after writing — it is NOT removed.', array( 'status' => 500 ) );
+	}
+	return rest_ensure_response( array( 'removed' => true, 'persisted' => true, 'path' => $path, 'rule' => $removed, 'remaining' => count( $rules ) ) );
 }
 
 /* ================================================================== *

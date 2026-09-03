@@ -14,6 +14,7 @@ reason to hide it; not intended as a general-purpose plugin.
 | `site` | Read-only introspection: WP/PHP versions, active plugins, theme, post types, taxonomies, registered meta, capability report |
 | `meta` | Read/write arbitrary post meta — the escape hatch for ACF fields and plugin meta in no REST whitelist |
 | `events` | The Events Calendar **recurring** events, including **"will not occur"** exclusion dates |
+| `redirects` | Path → URL redirects managed over REST — legacy URLs after a page move, including the nested paths WordPress's own 404 guess can't rescue. Exact and `/*` prefix rules |
 | `updater` | One-click updates from this repo's releases |
 
 ### Why the events module exists
@@ -56,6 +57,9 @@ Base: `<site>/wp-json/atlas/v1`
 | `GET /events/{ref}/recurrence` | Raw `_EventRecurrence` + occurrence list |
 | `GET /events/{ref}/occurrences` | `{ count, dates[], occurrences[] }` |
 | `PUT /events/{ref}/recurrence` | Replace the rule + exclusions |
+| `GET /redirects` | Every redirect rule; `?resolve=/some/path` reports what that path would do |
+| `PUT /redirects` | Add or replace a rule `{path, to, status?, note?}`. Requires `confirm=true`; returns before/after, the page it would shadow, and a worked example. `path` ending in `/*` is a prefix rule; a `*` at the end of `to` carries the remainder |
+| `DELETE /redirects` | Remove a rule `{path}`. Requires `confirm=true` |
 
 `{ref}` = post ID, TEC provisional occurrence ID, or slug. **Prefer the slug** — it
 always resolves to the parent post.
