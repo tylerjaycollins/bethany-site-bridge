@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.12.0
+ * Version:     0.12.1
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -93,10 +93,11 @@
  *   GET  /content/find?text=        → where a string appears: posts, meta, options
  *   POST /content/replace           → {from,to,in?} serialized-safe replace. confirm=true.
  *   PUT  /events/{ref}              → edit an event's ordinary fields. confirm=true.
- *   GET  /files/{root}              → list files (root = mu-plugins | theme)
- *   GET  /files/{root}/{path}       → one file, base64 + sha1
- *   PUT  /files/{root}/{path}       → write {content_base64, expected_sha1}. confirm=true.
- *   DELETE /files/{root}/{path}     → move to backups. confirm=true.
+ *   GET  /files/{root}              → list files (root = mu-plugins | theme); ?path= reads one (base64 + sha1)
+ *   PUT  /files/{root}              → write {path, content_base64, expected_sha1}. confirm=true.
+ *   DELETE /files/{root}            → {path} move to backups. confirm=true.
+ *   (the file path is a PARAMETER, never a URL segment: the host's nginx serves
+ *    any URI ending in .php/.css itself — 403/404 — before WordPress runs)
  *   POST /files/restore             → {root, path, backup} put a backup back. confirm=true.
  *
  * {ref} = post ID, TEC provisional occurrence ID, or slug. Prefer the SLUG.
@@ -195,12 +196,9 @@ add_action( 'rest_api_init', function () {
 		array( 'methods' => 'POST', 'callback' => 'bsb_files_restore', 'permission_callback' => $auth ),
 	) );
 	register_rest_route( 'atlas/v1', '/files/(?P<root>mu-plugins|theme)', array(
-		array( 'methods' => 'GET', 'callback' => 'bsb_files_list', 'permission_callback' => $auth ),
-	) );
-	register_rest_route( 'atlas/v1', '/files/(?P<root>mu-plugins|theme)/(?P<path>.+)', array(
-		array( 'methods' => 'GET',    'callback' => 'bsb_files_get',    'permission_callback' => $auth ),
-		array( 'methods' => 'PUT',    'callback' => 'bsb_files_put',    'permission_callback' => $auth ),
-		array( 'methods' => 'DELETE', 'callback' => 'bsb_files_delete', 'permission_callback' => $auth ),
+		array( 'methods' => 'GET',    'callback' => 'bsb_files_list_or_get', 'permission_callback' => $auth ),
+		array( 'methods' => 'PUT',    'callback' => 'bsb_files_put',         'permission_callback' => $auth ),
+		array( 'methods' => 'DELETE', 'callback' => 'bsb_files_delete',      'permission_callback' => $auth ),
 	) );
 	register_rest_route( 'atlas/v1', '/events/(?P<ref>[^/]+)/recurrence', array(
 		array( 'methods' => 'GET', 'callback' => 'bsb_events_get_recurrence', 'permission_callback' => $auth ),
@@ -3078,7 +3076,13 @@ function bsb_files_describe( $abs, $rel ) {
 	);
 }
 
-/** GET /files/{root} — every allowed-extension file under the root (recursive), no content. */
+/** GET /files/{root} — list, or with ?path= read one file. The path is a parameter on purpose (see the header). */
+function bsb_files_list_or_get( WP_REST_Request $req ) {
+	$path = (string) $req->get_param( 'path' );
+	return $path !== '' ? bsb_files_get( $req ) : bsb_files_list( $req );
+}
+
+/** every allowed-extension file under the root (recursive), no content. */
 function bsb_files_list( WP_REST_Request $req ) {
 	$root = (string) $req->get_param( 'root' );
 	$dir  = bsb_files_root_dir( $root );
