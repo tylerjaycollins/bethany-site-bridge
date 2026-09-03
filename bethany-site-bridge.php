@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.11.0
+ * Version:     0.12.0
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -37,6 +37,8 @@
  *             plus a nested-404 rescue and per-rule hit/referer stats.
  *   content — find text across post content, post meta and options (core search
  *             only sees post content), and a serialized-safe replace.
+ *   files   — read/write files under wp-content/mu-plugins and the child theme:
+ *             the SFTP replacement, with lint, backups and sha1-checked overwrites.
  *   tweaks  — the site's custom PHP, absorbed from the Code Snippets plugin (v0.9.0)
  *             so it ships through this plugin's one-click update instead of being
  *             hand-edited in wp-admin: trip-update nested URLs (snippet #5), trip
@@ -91,6 +93,11 @@
  *   GET  /content/find?text=        → where a string appears: posts, meta, options
  *   POST /content/replace           → {from,to,in?} serialized-safe replace. confirm=true.
  *   PUT  /events/{ref}              → edit an event's ordinary fields. confirm=true.
+ *   GET  /files/{root}              → list files (root = mu-plugins | theme)
+ *   GET  /files/{root}/{path}       → one file, base64 + sha1
+ *   PUT  /files/{root}/{path}       → write {content_base64, expected_sha1}. confirm=true.
+ *   DELETE /files/{root}/{path}     → move to backups. confirm=true.
+ *   POST /files/restore             → {root, path, backup} put a backup back. confirm=true.
  *
  * {ref} = post ID, TEC provisional occurrence ID, or slug. Prefer the SLUG.
  *
@@ -181,6 +188,19 @@ add_action( 'rest_api_init', function () {
 	) );
 	register_rest_route( 'atlas/v1', '/content/replace', array(
 		array( 'methods' => 'POST', 'callback' => 'bsb_content_replace', 'permission_callback' => $auth ),
+	) );
+
+	// --- files ---
+	register_rest_route( 'atlas/v1', '/files/restore', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_files_restore', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/files/(?P<root>mu-plugins|theme)', array(
+		array( 'methods' => 'GET', 'callback' => 'bsb_files_list', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/files/(?P<root>mu-plugins|theme)/(?P<path>.+)', array(
+		array( 'methods' => 'GET',    'callback' => 'bsb_files_get',    'permission_callback' => $auth ),
+		array( 'methods' => 'PUT',    'callback' => 'bsb_files_put',    'permission_callback' => $auth ),
+		array( 'methods' => 'DELETE', 'callback' => 'bsb_files_delete', 'permission_callback' => $auth ),
 	) );
 	register_rest_route( 'atlas/v1', '/events/(?P<ref>[^/]+)/recurrence', array(
 		array( 'methods' => 'GET', 'callback' => 'bsb_events_get_recurrence', 'permission_callback' => $auth ),
@@ -660,7 +680,7 @@ function bsb_site_report( WP_REST_Request $req ) {
 		'bridge' => array(
 			'version'        => bsb_installed_version(),
 			'secret_defined' => bsb_secret() !== '',
-			'modules'        => array( 'site', 'meta', 'options', 'events', 'redirects', 'content', 'tweaks', 'updater' ),
+			'modules'        => array( 'site', 'meta', 'options', 'events', 'redirects', 'content', 'files', 'tweaks', 'updater' ),
 			'redirect_rules' => count( bsb_redirects_all() ),
 			// Where the GF poke token is coming from — never the value itself.
 			'gf_poke_token'  => ( defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '' )
@@ -678,6 +698,7 @@ function bsb_site_report( WP_REST_Request $req ) {
 			'acf_active'            => function_exists( 'get_field' ),
 			'pretty_links_bridge'   => function_exists( 'atlas_prli_auth' ),
 			'hummingbird_page_cache'=> has_action( 'wphb_clear_page_cache' ) !== false,
+			'files'                 => bsb_files_capabilities(),
 			'opcache'               => function_exists( 'opcache_reset' ),
 			'object_cache'          => wp_using_ext_object_cache(),
 		),
@@ -2862,6 +2883,417 @@ function bsb_content_replace( WP_REST_Request $req ) {
 		'details'         => $done,
 		'note'            => 'Rows were written directly (no save hooks fired). Run POST /site/purge-cache so the public pages re-render.',
 	) );
+}
+
+/* ================================================================== *
+ * MODULE: files — the SFTP replacement, fenced
+ * ================================================================== *
+ *
+ * This host gives us no SFTP, the Theme File Editor can't save (its loopback
+ * check is blocked by the firewall in front of the site), and the same firewall
+ * 403s any request body containing PHP source. So "put PHP on the site" has been
+ * impossible from anywhere but the host's own file manager. This module is the
+ * hatch: file content travels base64-encoded, and the writable area is exactly
+ * two roots — wp-content/mu-plugins and the active child theme. Nothing else is
+ * addressable, and this plugin's own directory is deliberately not among them.
+ *
+ * WHY IT IS CAREFUL. A PHP file in mu-plugins is executed on EVERY request with
+ * no activation step; a parse error there white-screens the whole site, and so
+ * does the REST API — meaning the tool that made the mistake can't undo it. So:
+ *   - .php content is syntax-checked BEFORE it touches disk: `php -l` when exec
+ *     is available, otherwise opcache_compile_file() (compiles without running;
+ *     a ParseError is caught). No lint path available → .php is refused unless
+ *     force=true, and the caller should have linted locally.
+ *   - function names declared in the new file that already exist at runtime but
+ *     were NOT declared by the file's current version are reported as a probable
+ *     redeclaration fatal; the write needs force=true to proceed.
+ *   - every overwrite and delete first copies the current file to a backup dir
+ *     OUTSIDE both roots (a *.bak in mu-plugins would itself be auto-loaded),
+ *     under wp-content/bsb-backups/<random>/, and reports the backup path;
+ *     POST /files/restore puts one back.
+ *   - overwriting needs expected_sha1 = the sha1 of what is there now, so two
+ *     people can't clobber each other, and a caller always reads before writing.
+ *   - allowed extensions only: php css js json txt md html svg xml. No dotfiles.
+ * Writes are confirm=true two-phase; the dry run reports the lint verdict and the
+ * size/line delta, so a bad file is caught before the token is even issued.
+ */
+
+const BSB_FILES_MAX_BYTES = 2 * 1024 * 1024;
+
+function bsb_files_root_dir( $root ) {
+	if ( $root === 'mu-plugins' ) {
+		return defined( 'WPMU_PLUGIN_DIR' ) ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR . '/mu-plugins';
+	}
+	if ( $root === 'theme' ) {
+		return get_stylesheet_directory();
+	}
+	return null;
+}
+
+function bsb_files_allowed_ext() {
+	return array( 'php', 'css', 'js', 'json', 'txt', 'md', 'html', 'svg', 'xml' );
+}
+
+/** Backup directory (created on demand, randomised once, index.php dropped in). */
+function bsb_files_backup_dir() {
+	$token = bsb_option_read( 'bsb_files_backup_token' );
+	if ( $token === '' ) {
+		$token = wp_generate_password( 16, false, false );
+		bsb_option_write( 'bsb_files_backup_token', $token );
+	}
+	$dir = WP_CONTENT_DIR . '/bsb-backups/' . $token;
+	if ( ! is_dir( $dir ) ) {
+		wp_mkdir_p( $dir );
+		@file_put_contents( WP_CONTENT_DIR . '/bsb-backups/index.php', "<?php // silence\n" );
+		@file_put_contents( $dir . '/index.php', "<?php // silence\n" );
+	}
+	return $dir;
+}
+
+function bsb_files_exec_available() {
+	if ( ! function_exists( 'exec' ) ) {
+		return false;
+	}
+	$disabled = array_map( 'trim', explode( ',', (string) ini_get( 'disable_functions' ) ) );
+	return ! in_array( 'exec', $disabled, true );
+}
+
+/** Path to a CLI php binary usable for -l, or ''. */
+function bsb_files_php_cli() {
+	$candidates = array();
+	if ( defined( 'PHP_BINARY' ) && PHP_BINARY && strpos( PHP_BINARY, 'fpm' ) === false ) {
+		$candidates[] = PHP_BINARY;
+	}
+	if ( defined( 'PHP_BINDIR' ) ) {
+		$candidates[] = PHP_BINDIR . '/php';
+	}
+	array_push( $candidates, '/usr/bin/php', '/usr/local/bin/php', '/usr/bin/php' . PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION );
+	foreach ( array_unique( $candidates ) as $c ) {
+		if ( $c && @is_executable( $c ) ) {
+			return $c;
+		}
+	}
+	return '';
+}
+
+function bsb_files_capabilities() {
+	$mu    = bsb_files_root_dir( 'mu-plugins' );
+	$theme = bsb_files_root_dir( 'theme' );
+	return array(
+		'mu_plugins_dir'      => $mu,
+		'mu_plugins_writable' => is_dir( $mu ) ? wp_is_writable( $mu ) : wp_is_writable( dirname( $mu ) ),
+		'theme_dir'           => $theme,
+		'theme_writable'      => wp_is_writable( $theme ),
+		'lint'                => bsb_files_exec_available() && bsb_files_php_cli() !== '' ? 'php -l' : ( function_exists( 'opcache_compile_file' ) ? 'opcache_compile_file' : 'none' ),
+	);
+}
+
+/**
+ * Resolve root+relative path to an absolute path INSIDE the root. Returns
+ * array( abs, rel ) or WP_Error. Refuses traversal, dotfiles, unknown extensions.
+ */
+function bsb_files_resolve( $root, $rel, $must_exist = false ) {
+	$dir = bsb_files_root_dir( $root );
+	if ( ! $dir ) {
+		return new WP_Error( 'bsb_bad_root', 'root must be mu-plugins or theme', array( 'status' => 400 ) );
+	}
+	$rel = str_replace( '\\', '/', (string) $rel );
+	$rel = trim( preg_replace( '#/+#', '/', $rel ), '/' );
+	if ( $rel === '' || strpos( $rel, "\0" ) !== false ) {
+		return new WP_Error( 'bsb_bad_path', 'A file path is required', array( 'status' => 400 ) );
+	}
+	foreach ( explode( '/', $rel ) as $seg ) {
+		if ( $seg === '.' || $seg === '..' || $seg === '' || $seg[0] === '.' ) {
+			return new WP_Error( 'bsb_bad_path', 'Path segments may not be ".", ".." or start with a dot', array( 'status' => 400 ) );
+		}
+		if ( ! preg_match( '/^[A-Za-z0-9._\-]+$/', $seg ) ) {
+			return new WP_Error( 'bsb_bad_path', "Unexpected characters in path segment \"$seg\"", array( 'status' => 400 ) );
+		}
+	}
+	$ext = strtolower( pathinfo( $rel, PATHINFO_EXTENSION ) );
+	if ( ! in_array( $ext, bsb_files_allowed_ext(), true ) ) {
+		return new WP_Error( 'bsb_bad_ext', 'Extension must be one of ' . implode( ', ', bsb_files_allowed_ext() ), array( 'status' => 400 ) );
+	}
+	$abs      = rtrim( $dir, '/' ) . '/' . $rel;
+	$real_dir = realpath( $dir );
+	$real     = file_exists( $abs ) ? realpath( $abs ) : realpath( dirname( $abs ) ) . '/' . basename( $abs );
+	if ( ! $real_dir || ! $real || strpos( $real, rtrim( $real_dir, '/' ) . '/' ) !== 0 ) {
+		return new WP_Error( 'bsb_bad_path', 'Path resolves outside the root', array( 'status' => 400 ) );
+	}
+	if ( file_exists( $real ) && is_link( $abs ) ) {
+		return new WP_Error( 'bsb_bad_path', 'Refusing to operate on a symlink', array( 'status' => 400 ) );
+	}
+	if ( $must_exist && ! is_file( $real ) ) {
+		return new WP_Error( 'bsb_not_found', "No file at $root/$rel", array( 'status' => 404 ) );
+	}
+	return array( $real, $rel );
+}
+
+/** Syntax-check PHP source. Returns array( ok bool|null, method, message ). null = no lint available. */
+function bsb_files_lint_php( $source ) {
+	$tmp_dir = get_temp_dir();
+	$tmp     = rtrim( $tmp_dir, '/' ) . '/bsb-lint-' . wp_generate_password( 8, false, false ) . '.php';
+	if ( @file_put_contents( $tmp, $source ) === false ) {
+		return array( null, 'none', 'could not write a temp file to lint' );
+	}
+	try {
+		$php = bsb_files_exec_available() ? bsb_files_php_cli() : '';
+		if ( $php !== '' ) {
+			$out  = array();
+			$code = 1;
+			@exec( escapeshellarg( $php ) . ' -d display_errors=1 -l ' . escapeshellarg( $tmp ) . ' 2>&1', $out, $code );
+			$msg = trim( str_replace( $tmp, '<file>', implode( "\n", $out ) ) );
+			return array( $code === 0, 'php -l', $msg );
+		}
+		if ( function_exists( 'opcache_compile_file' ) ) {
+			try {
+				$ok = @opcache_compile_file( $tmp );
+				return array( (bool) $ok, 'opcache_compile_file', $ok ? 'No syntax errors detected' : 'opcache_compile_file returned false (opcache may be disabled for this SAPI)' );
+			} catch ( \ParseError $e ) {
+				return array( false, 'opcache_compile_file', 'Parse error: ' . $e->getMessage() . ' on line ' . $e->getLine() );
+			} catch ( \Throwable $e ) {
+				return array( false, 'opcache_compile_file', get_class( $e ) . ': ' . $e->getMessage() );
+			}
+		}
+		return array( null, 'none', 'no lint path on this host (exec disabled, no opcache) — lint locally and pass force=true' );
+	} finally {
+		@unlink( $tmp );
+	}
+}
+
+/** Top-level-ish function names declared in PHP source (cheap regex; class methods excluded by indentation heuristics are NOT attempted — names are just names). */
+function bsb_files_declared_functions( $source ) {
+	preg_match_all( '/^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/m', (string) $source, $m );
+	return array_values( array_unique( $m[1] ) );
+}
+
+function bsb_files_describe( $abs, $rel ) {
+	$content = (string) file_get_contents( $abs );
+	return array(
+		'path'     => $rel,
+		'bytes'    => strlen( $content ),
+		'lines'    => $content === '' ? 0 : substr_count( $content, "\n" ) + 1,
+		'sha1'     => sha1( $content ),
+		'modified' => gmdate( 'c', (int) filemtime( $abs ) ),
+	);
+}
+
+/** GET /files/{root} — every allowed-extension file under the root (recursive), no content. */
+function bsb_files_list( WP_REST_Request $req ) {
+	$root = (string) $req->get_param( 'root' );
+	$dir  = bsb_files_root_dir( $root );
+	if ( ! $dir ) {
+		return new WP_Error( 'bsb_bad_root', 'root must be mu-plugins or theme', array( 'status' => 400 ) );
+	}
+	$out = array();
+	if ( is_dir( $dir ) ) {
+		$it = new RecursiveIteratorIterator( new RecursiveDirectoryIterator( $dir, FilesystemIterator::SKIP_DOTS ), RecursiveIteratorIterator::SELF_FIRST );
+		foreach ( $it as $f ) {
+			/** @var SplFileInfo $f */
+			if ( ! $f->isFile() || $it->getDepth() > 6 ) {
+				continue;
+			}
+			$rel = ltrim( str_replace( rtrim( $dir, '/' ), '', str_replace( '\\', '/', $f->getPathname() ) ), '/' );
+			if ( strpos( '/' . $rel, '/.' ) !== false ) {
+				continue;
+			}
+			if ( ! in_array( strtolower( $f->getExtension() ), bsb_files_allowed_ext(), true ) ) {
+				continue;
+			}
+			$out[] = array( 'path' => $rel, 'bytes' => $f->getSize(), 'modified' => gmdate( 'c', $f->getMTime() ) );
+			if ( count( $out ) >= 500 ) {
+				break;
+			}
+		}
+	}
+	usort( $out, function ( $a, $b ) { return strcmp( $a['path'], $b['path'] ); } );
+	return rest_ensure_response( array( 'root' => $root, 'dir' => $dir, 'exists' => is_dir( $dir ), 'count' => count( $out ), 'files' => $out, 'capabilities' => bsb_files_capabilities() ) );
+}
+
+function bsb_files_get( WP_REST_Request $req ) {
+	$r = bsb_files_resolve( (string) $req->get_param( 'root' ), (string) $req->get_param( 'path' ), true );
+	if ( is_wp_error( $r ) ) {
+		return $r;
+	}
+	list( $abs, $rel ) = $r;
+	$content = (string) file_get_contents( $abs );
+	return rest_ensure_response( array_merge( array( 'root' => $req->get_param( 'root' ) ), bsb_files_describe( $abs, $rel ), array(
+		'content_base64' => base64_encode( $content ),
+		'declares'       => strtolower( pathinfo( $rel, PATHINFO_EXTENSION ) ) === 'php' ? bsb_files_declared_functions( $content ) : null,
+	) ) );
+}
+
+/** Copy the current file to the backup dir; returns the backup's basename. */
+function bsb_files_backup( $abs, $root, $rel ) {
+	$dir  = bsb_files_backup_dir();
+	$name = $root . '__' . str_replace( '/', '__', $rel ) . '.' . gmdate( 'Ymd-His' ) . '.bak';
+	if ( ! @copy( $abs, $dir . '/' . $name ) ) {
+		return new WP_Error( 'bsb_backup_failed', 'Could not write the backup — refusing to change the file', array( 'status' => 500 ) );
+	}
+	return $name;
+}
+
+/** PUT /files/{root}/{path} {content_base64, expected_sha1?, force?, confirm} */
+function bsb_files_put( WP_REST_Request $req ) {
+	$root = (string) $req->get_param( 'root' );
+	$r    = bsb_files_resolve( $root, (string) $req->get_param( 'path' ) );
+	if ( is_wp_error( $r ) ) {
+		return $r;
+	}
+	list( $abs, $rel ) = $r;
+	$b64 = (string) $req->get_param( 'content_base64' );
+	if ( $b64 === '' ) {
+		return new WP_Error( 'bsb_no_content', 'content_base64 is required (base64 of the full new file)', array( 'status' => 400 ) );
+	}
+	$content = base64_decode( $b64, true );
+	if ( $content === false ) {
+		return new WP_Error( 'bsb_bad_base64', 'content_base64 is not valid base64', array( 'status' => 400 ) );
+	}
+	if ( strlen( $content ) > BSB_FILES_MAX_BYTES ) {
+		return new WP_Error( 'bsb_too_big', 'File exceeds ' . BSB_FILES_MAX_BYTES . ' bytes', array( 'status' => 413 ) );
+	}
+	$exists  = is_file( $abs );
+	$current = $exists ? bsb_files_describe( $abs, $rel ) : null;
+	$force   = filter_var( $req->get_param( 'force' ), FILTER_VALIDATE_BOOLEAN );
+	$is_php  = strtolower( pathinfo( $rel, PATHINFO_EXTENSION ) ) === 'php';
+
+	if ( $exists ) {
+		$expected = (string) $req->get_param( 'expected_sha1' );
+		if ( $expected === '' ) {
+			return new WP_Error( 'bsb_sha_required', 'This file exists — pass expected_sha1 (its current sha1 is ' . $current['sha1'] . ', from GET) so a stale copy can\'t overwrite a newer one', array( 'status' => 409, 'current_sha1' => $current['sha1'] ) );
+		}
+		if ( ! hash_equals( $current['sha1'], strtolower( $expected ) ) ) {
+			return new WP_Error( 'bsb_sha_mismatch', 'expected_sha1 does not match the file on disk (' . $current['sha1'] . ') — it changed since you read it. Re-read and try again.', array( 'status' => 409, 'current_sha1' => $current['sha1'] ) );
+		}
+		if ( $current['sha1'] === sha1( $content ) ) {
+			return rest_ensure_response( array( 'updated' => false, 'note' => 'Identical content — nothing to write', 'file' => $current ) );
+		}
+	}
+
+	$lint = array( null, 'n/a', 'not PHP' );
+	$redeclare = array();
+	if ( $is_php ) {
+		if ( strpos( ltrim( $content ), '<?php' ) !== 0 ) {
+			return new WP_Error( 'bsb_not_php', 'A .php file must start with <?php', array( 'status' => 400 ) );
+		}
+		$lint = bsb_files_lint_php( $content );
+		if ( $lint[0] === false ) {
+			return new WP_Error( 'bsb_lint_failed', 'PHP syntax check failed (' . $lint[1] . '): ' . $lint[2], array( 'status' => 422 ) );
+		}
+		if ( $lint[0] === null && ! $force ) {
+			return new WP_Error( 'bsb_no_lint', $lint[2], array( 'status' => 501 ) );
+		}
+		$old_names = $exists ? bsb_files_declared_functions( (string) file_get_contents( $abs ) ) : array();
+		foreach ( bsb_files_declared_functions( $content ) as $fn ) {
+			if ( function_exists( $fn ) && ! in_array( $fn, $old_names, true ) ) {
+				$redeclare[] = $fn;
+			}
+		}
+		if ( $redeclare && ! $force ) {
+			return new WP_Error( 'bsb_redeclare', 'These functions already exist at runtime and are not declared by the current version of this file — loading it would fatal unless each is function_exists()-guarded: ' . implode( ', ', $redeclare ) . '. Pass force=true only if they are guarded.', array( 'status' => 409, 'functions' => $redeclare ) );
+		}
+	}
+
+	$preview = array(
+		'root'      => $root,
+		'path'      => $rel,
+		'exists'    => $exists,
+		'current'   => $current,
+		'new'       => array( 'bytes' => strlen( $content ), 'lines' => $content === '' ? 0 : substr_count( $content, "\n" ) + 1, 'sha1' => sha1( $content ) ),
+		'lint'      => array( 'ok' => $lint[0], 'method' => $lint[1], 'message' => $lint[2] ),
+		'redeclare' => $redeclare,
+		'backup_to' => $exists ? bsb_files_backup_dir() : null,
+	);
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array_merge( array( 'dry_run' => true, 'note' => 'confirm=true was not passed — nothing written' ), $preview ) );
+	}
+
+	$backup = null;
+	if ( $exists ) {
+		$backup = bsb_files_backup( $abs, $root, $rel );
+		if ( is_wp_error( $backup ) ) {
+			return $backup;
+		}
+	} elseif ( ! is_dir( dirname( $abs ) ) && ! wp_mkdir_p( dirname( $abs ) ) ) {
+		return new WP_Error( 'bsb_mkdir_failed', 'Could not create ' . dirname( $rel ), array( 'status' => 500 ) );
+	}
+	// Write beside, then rename: a reader (or the autoloader) never sees a half file.
+	$tmp = $abs . '.bsb-tmp-' . wp_generate_password( 6, false, false );
+	if ( @file_put_contents( $tmp, $content ) !== strlen( $content ) || ! @rename( $tmp, $abs ) ) {
+		@unlink( $tmp );
+		return new WP_Error( 'bsb_write_failed', 'Could not write the file (permissions?)', array( 'status' => 500 ) );
+	}
+	if ( function_exists( 'opcache_invalidate' ) ) {
+		@opcache_invalidate( $abs, true );
+	}
+	$after = bsb_files_describe( $abs, $rel );
+	return rest_ensure_response( array_merge( array(
+		'updated'   => true,
+		'persisted' => $after['sha1'] === sha1( $content ),
+		'backup'    => $backup,
+		'after'     => $after,
+		'note'      => $is_php && $root === 'mu-plugins' ? 'mu-plugin written — it runs on the NEXT request. Immediately GET /site; if that fails, the host file manager and the backup above are the way back.' : null,
+	), $preview ) );
+}
+
+/** DELETE /files/{root}/{path} {confirm} — moves the file to backups rather than deleting. */
+function bsb_files_delete( WP_REST_Request $req ) {
+	$root = (string) $req->get_param( 'root' );
+	$r    = bsb_files_resolve( $root, (string) $req->get_param( 'path' ), true );
+	if ( is_wp_error( $r ) ) {
+		return $r;
+	}
+	list( $abs, $rel ) = $r;
+	$current = bsb_files_describe( $abs, $rel );
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array( 'dry_run' => true, 'note' => 'confirm=true was not passed — nothing removed', 'root' => $root, 'file' => $current, 'backup_to' => bsb_files_backup_dir() ) );
+	}
+	$backup = bsb_files_backup( $abs, $root, $rel );
+	if ( is_wp_error( $backup ) ) {
+		return $backup;
+	}
+	if ( ! @unlink( $abs ) ) {
+		return new WP_Error( 'bsb_delete_failed', 'Backup written but the file could not be removed', array( 'status' => 500, 'backup' => $backup ) );
+	}
+	if ( function_exists( 'opcache_invalidate' ) ) {
+		@opcache_invalidate( $abs, true );
+	}
+	return rest_ensure_response( array( 'removed' => true, 'root' => $root, 'file' => $current, 'backup' => $backup ) );
+}
+
+/** POST /files/restore {root, path, backup, confirm} — put a backup back (current file is backed up first). */
+function bsb_files_restore( WP_REST_Request $req ) {
+	$root = (string) $req->get_param( 'root' );
+	$r    = bsb_files_resolve( $root, (string) $req->get_param( 'path' ) );
+	if ( is_wp_error( $r ) ) {
+		return $r;
+	}
+	list( $abs, $rel ) = $r;
+	$name = basename( (string) $req->get_param( 'backup' ) );
+	$src  = bsb_files_backup_dir() . '/' . $name;
+	if ( $name === '' || ! preg_match( '/\.bak$/', $name ) || ! is_file( $src ) ) {
+		return new WP_Error( 'bsb_no_backup', 'No such backup', array( 'status' => 404 ) );
+	}
+	$content = (string) file_get_contents( $src );
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array( 'dry_run' => true, 'note' => 'confirm=true was not passed — nothing restored', 'root' => $root, 'path' => $rel, 'backup' => $name, 'backup_sha1' => sha1( $content ), 'current' => is_file( $abs ) ? bsb_files_describe( $abs, $rel ) : null ) );
+	}
+	$prior = null;
+	if ( is_file( $abs ) ) {
+		$prior = bsb_files_backup( $abs, $root, $rel );
+		if ( is_wp_error( $prior ) ) {
+			return $prior;
+		}
+	}
+	$tmp = $abs . '.bsb-tmp-' . wp_generate_password( 6, false, false );
+	if ( @file_put_contents( $tmp, $content ) !== strlen( $content ) || ! @rename( $tmp, $abs ) ) {
+		@unlink( $tmp );
+		return new WP_Error( 'bsb_write_failed', 'Could not restore (permissions?)', array( 'status' => 500 ) );
+	}
+	if ( function_exists( 'opcache_invalidate' ) ) {
+		@opcache_invalidate( $abs, true );
+	}
+	return rest_ensure_response( array( 'restored' => true, 'root' => $root, 'path' => $rel, 'from_backup' => $name, 'replaced_backed_up_as' => $prior, 'after' => bsb_files_describe( $abs, $rel ) ) );
 }
 
 /* ================================================================== *

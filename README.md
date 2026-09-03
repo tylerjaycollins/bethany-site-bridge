@@ -17,6 +17,7 @@ reason to hide it; not intended as a general-purpose plugin.
 | `events` | The Events Calendar **recurring** events, including **"will not occur"** exclusion dates |
 | `redirects` | Path → URL redirects managed over REST — legacy URLs after a page move, including the nested paths WordPress's own 404 guess can't rescue. Exact and `/*` prefix rules, per-rule hit/referer stats, and a nested-404 rescue (a multi-segment 404 whose last segment is exactly one published page/post's slug is 301'd there; off via option `bsb_redirects_settings` `{"rescue":false}`) |
 | `content` | Find text across post content, post meta (Cornerstone builder JSON included — JSON-escaped slashes are searched too) and options; serialized-safe replace with a dry run listing every row |
+| `files` | Read/write files under `wp-content/mu-plugins` and the active child theme — the SFTP replacement. Base64 transport (the host firewall rejects PHP in request bodies), PHP syntax lint before any write, redeclaration check, backups outside the auto-loaded dirs, sha1-checked overwrites, restore |
 | `updater` | One-click updates from this repo's releases |
 
 ### Why the events module exists
@@ -72,6 +73,11 @@ Base: `<site>/wp-json/atlas/v1`
 | `GET /content/find` | `?text=&in=posts,meta,options&post_type=&limit=` — every row containing the text, with snippets |
 | `POST /content/replace` | `{from, to, in?, post_type?, limit?}` serialized-safe replace. Requires `confirm=true`; the dry run is the exact plan. Refuses needles under 4 chars and more rows than `limit` (default 200) |
 | `PUT /events/{ref}` | Edit an event's ordinary fields (title, description, dates, venue, organizer, website, cost, terms, thumbnail, ACF). Only the fields passed change; recurrence is snapshotted and restored; dates on a recurring series need `apply_to=series` + `expected_count`. Requires `confirm=true` |
+| `GET /files/{root}` | List files under `mu-plugins` or `theme` (no content) plus writability/lint capabilities |
+| `GET /files/{root}/{path}` | One file: base64 content, sha1, size, declared functions |
+| `PUT /files/{root}/{path}` | Write `{content_base64, expected_sha1 (required when the file exists), force?}`. Requires `confirm=true`. .php is linted first (`php -l` or `opcache_compile_file`), refused on syntax error or probable redeclaration; the previous version is backed up and its name returned |
+| `DELETE /files/{root}/{path}` | Moves the file to backups. Requires `confirm=true` |
+| `POST /files/restore` | `{root, path, backup}` puts a backup back (current file backed up first). Requires `confirm=true` |
 
 `{ref}` = post ID, TEC provisional occurrence ID, or slug. **Prefer the slug** — it
 always resolves to the parent post.
