@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.10.0
+ * Version:     0.11.0
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -33,7 +33,10 @@
  *             options that can take the site down or leak a secret.
  *   events  — The Events Calendar RECURRING events + "will not occur" exclusions.
  *   redirects — path → URL redirects managed over REST (legacy URLs after a
- *             page move; the nested paths WordPress's own 404 guess can't rescue).
+ *             page move; the nested paths WordPress's own 404 guess can't rescue),
+ *             plus a nested-404 rescue and per-rule hit/referer stats.
+ *   content — find text across post content, post meta and options (core search
+ *             only sees post content), and a serialized-safe replace.
  *   tweaks  — the site's custom PHP, absorbed from the Code Snippets plugin (v0.9.0)
  *             so it ships through this plugin's one-click update instead of being
  *             hand-edited in wp-admin: trip-update nested URLs (snippet #5), trip
@@ -85,6 +88,9 @@
  *   GET  /redirects                 → every rule (+ ?resolve=/some/path to test one)
  *   PUT  /redirects                 → add/replace a rule {path,to,status,note}. confirm=true.
  *   DELETE /redirects               → remove a rule {path}. confirm=true.
+ *   GET  /content/find?text=        → where a string appears: posts, meta, options
+ *   POST /content/replace           → {from,to,in?} serialized-safe replace. confirm=true.
+ *   PUT  /events/{ref}              → edit an event's ordinary fields. confirm=true.
  *
  * {ref} = post ID, TEC provisional occurrence ID, or slug. Prefer the SLUG.
  *
@@ -164,6 +170,17 @@ add_action( 'rest_api_init', function () {
 	// --- events ---
 	register_rest_route( 'atlas/v1', '/events', array(
 		array( 'methods' => 'POST', 'callback' => 'bsb_events_create', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/events/(?P<ref>[^/]+)', array(
+		array( 'methods' => 'PUT', 'callback' => 'bsb_events_update', 'permission_callback' => $auth ),
+	) );
+
+	// --- content ---
+	register_rest_route( 'atlas/v1', '/content/find', array(
+		array( 'methods' => 'GET', 'callback' => 'bsb_content_find', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/content/replace', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_content_replace', 'permission_callback' => $auth ),
 	) );
 	register_rest_route( 'atlas/v1', '/events/(?P<ref>[^/]+)/recurrence', array(
 		array( 'methods' => 'GET', 'callback' => 'bsb_events_get_recurrence', 'permission_callback' => $auth ),
@@ -643,7 +660,7 @@ function bsb_site_report( WP_REST_Request $req ) {
 		'bridge' => array(
 			'version'        => bsb_installed_version(),
 			'secret_defined' => bsb_secret() !== '',
-			'modules'        => array( 'site', 'meta', 'options', 'events', 'redirects', 'tweaks', 'updater' ),
+			'modules'        => array( 'site', 'meta', 'options', 'events', 'redirects', 'content', 'tweaks', 'updater' ),
 			'redirect_rules' => count( bsb_redirects_all() ),
 			// Where the GF poke token is coming from — never the value itself.
 			'gf_poke_token'  => ( defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '' )
@@ -1725,6 +1742,214 @@ function bsb_events_create( WP_REST_Request $req ) {
 	) );
 }
 
+
+/**
+ * PUT /events/{ref} — edit an existing event's ordinary fields.
+ *
+ * The missing sibling of POST /events. TEC's own REST is the alternative and it
+ * is the reason this exists: a partial POST to tribe/events/v1/events/{id} wipes
+ * whatever it wasn't told about — recurrence, website, thumbnail, organizer
+ * (found 2026-08). This goes through tribe_update_event() with ONLY the fields
+ * passed, reads everything back off the saved post, and guards the two ways an
+ * edit hurts a recurring series:
+ *   - dates on a recurring event move EVERY occurrence, so changing them needs
+ *     apply_to=series AND expected_count equal to the current occurrence count;
+ *   - _EventRecurrence is snapshotted before the write and restored if the update
+ *     path dropped it (reported as recurrence_restored), and occurrence counts are
+ *     compared before/after.
+ * A provisional occurrence id is refused without apply_to=series, same as /meta.
+ */
+function bsb_events_update( WP_REST_Request $req ) {
+	$resolved = bsb_resolve( $req->get_param( 'ref' ), 'tribe_events' );
+	if ( is_wp_error( $resolved ) ) {
+		return $resolved;
+	}
+	list( $post_id, $was_provisional ) = $resolved;
+	$apply_series = $req->get_param( 'apply_to' ) === 'series';
+	if ( $was_provisional && ! $apply_series ) {
+		return new WP_Error( 'bsb_provisional_ref', sprintf(
+			'That is a provisional OCCURRENCE id — edits land on parent post %d and affect the whole series. Pass apply_to=series to confirm, or reference the slug "%s".',
+			$post_id, get_post_field( 'post_name', $post_id )
+		), array( 'status' => 409 ) );
+	}
+
+	$p        = $req->get_params();
+	$has      = function ( $k ) use ( $p ) { return array_key_exists( $k, $p ) && $p[ $k ] !== null; };
+	$editable = array( 'title', 'description', 'excerpt', 'status', 'start_date', 'end_date', 'all_day', 'timezone', 'website', 'cost', 'venue', 'organizer', 'categories', 'tags', 'featured_media', 'acf' );
+	$given    = array_values( array_filter( $editable, $has ) );
+	if ( ! $given ) {
+		return new WP_Error( 'bsb_no_fields', 'Nothing to change — pass one or more of: ' . implode( ', ', $editable ), array( 'status' => 400 ) );
+	}
+	if ( $has( 'start_date' ) !== $has( 'end_date' ) ) {
+		return new WP_Error( 'bsb_dates_pair', 'start_date and end_date must be changed together (TEC derives one from the other otherwise)', array( 'status' => 400 ) );
+	}
+	if ( $has( 'status' ) && ! in_array( $p['status'], array( 'publish', 'draft', 'pending', 'private' ), true ) ) {
+		return new WP_Error( 'bsb_bad_status', 'status must be publish, draft, pending or private', array( 'status' => 400 ) );
+	}
+
+	$is_recurring = function_exists( 'tribe_is_recurring_event' ) ? (bool) tribe_is_recurring_event( $post_id ) : (bool) get_post_meta( $post_id, '_EventRecurrence', true );
+	$occ_before   = bsb_events_occurrences_for( $post_id );
+	$dates_change = $has( 'start_date' ) || $has( 'all_day' ) || $has( 'timezone' );
+	if ( $is_recurring && $dates_change ) {
+		$count = is_array( $occ_before ) ? count( $occ_before ) : null;
+		if ( ! $apply_series || $req->get_param( 'expected_count' ) === null || (int) $req->get_param( 'expected_count' ) !== (int) $count ) {
+			return new WP_Error( 'bsb_series_dates', sprintf(
+				'This is a RECURRING series with %s occurrences — changing its dates moves every one of them. Pass apply_to=series AND expected_count=%s to confirm that is intended.',
+				$count === null ? '?' : $count, $count === null ? '<count>' : $count
+			), array( 'status' => 409 ) );
+		}
+	}
+
+	$snapshot = function () use ( $post_id ) {
+		$venue = (int) get_post_meta( $post_id, '_EventVenueID', true );
+		$orgs  = array_map( 'intval', (array) get_post_meta( $post_id, '_EventOrganizerID', false ) );
+		$acf   = array();
+		if ( function_exists( 'get_field_objects' ) ) {
+			foreach ( (array) get_field_objects( $post_id ) as $name => $f ) {
+				$acf[ $name ] = isset( $f['value'] ) ? $f['value'] : null;
+			}
+		}
+		$cats = wp_get_object_terms( $post_id, 'tribe_events_cat', array( 'fields' => 'ids' ) );
+		$tags = wp_get_object_terms( $post_id, 'post_tag', array( 'fields' => 'ids' ) );
+		return array(
+			'title'          => get_the_title( $post_id ),
+			'status'         => get_post_status( $post_id ),
+			'description'    => (string) get_post_field( 'post_content', $post_id ),
+			'excerpt'        => (string) get_post_field( 'post_excerpt', $post_id ),
+			'start_date'     => get_post_meta( $post_id, '_EventStartDate', true ),
+			'end_date'       => get_post_meta( $post_id, '_EventEndDate', true ),
+			'all_day'        => get_post_meta( $post_id, '_EventAllDay', true ) === 'yes',
+			'timezone'       => get_post_meta( $post_id, '_EventTimezone', true ),
+			'website'        => get_post_meta( $post_id, '_EventURL', true ),
+			'cost'           => get_post_meta( $post_id, '_EventCost', true ),
+			'venue'          => $venue ? $venue : null,
+			'organizer'      => array_values( array_filter( $orgs ) ),
+			'categories'     => is_wp_error( $cats ) ? null : array_map( 'intval', $cats ),
+			'tags'           => is_wp_error( $tags ) ? null : array_map( 'intval', $tags ),
+			'featured_media' => (int) get_post_thumbnail_id( $post_id ) ?: null,
+			'acf'            => $acf,
+			'recurrence'     => get_post_meta( $post_id, '_EventRecurrence', true ),
+		);
+	};
+	$before = $snapshot();
+
+	$args = array();
+	if ( $has( 'title' ) )       { $args['post_title']   = (string) $p['title']; }
+	if ( $has( 'description' ) ) { $args['post_content'] = (string) $p['description']; }
+	if ( $has( 'excerpt' ) )     { $args['post_excerpt'] = (string) $p['excerpt']; }
+	if ( $has( 'status' ) )      { $args['post_status']  = (string) $p['status']; }
+	if ( $has( 'start_date' ) ) {
+		$start = (string) $p['start_date'];
+		$end   = (string) $p['end_date'];
+		if ( ! preg_match( '/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/', $start ) || ! preg_match( '/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/', $end ) ) {
+			return new WP_Error( 'bsb_bad_date', 'Dates must be "YYYY-MM-DD HH:MM" (or YYYY-MM-DD for all-day)', array( 'status' => 400 ) );
+		}
+		$args['EventStartDate']   = substr( $start, 0, 10 );
+		$args['EventEndDate']     = substr( $end, 0, 10 );
+		$args['EventStartHour']   = strlen( $start ) > 10 ? substr( $start, 11, 2 ) : '00';
+		$args['EventStartMinute'] = strlen( $start ) > 10 ? substr( $start, 14, 2 ) : '00';
+		$args['EventEndHour']     = strlen( $end ) > 10 ? substr( $end, 11, 2 ) : '23';
+		$args['EventEndMinute']   = strlen( $end ) > 10 ? substr( $end, 14, 2 ) : '59';
+	}
+	if ( $has( 'all_day' ) )  { $args['EventAllDay']   = filter_var( $p['all_day'], FILTER_VALIDATE_BOOLEAN ) ? 'yes' : ''; }
+	if ( $has( 'timezone' ) ) { $args['EventTimezone'] = (string) $p['timezone']; }
+	if ( $has( 'website' ) )  { $args['EventURL']      = (string) $p['website']; }
+	if ( $has( 'cost' ) )     { $args['EventCost']     = (string) $p['cost']; }
+	if ( $has( 'venue' ) )    { $args['venue']         = array( 'VenueID' => (int) $p['venue'] ); }
+	if ( $has( 'organizer' ) ) { $args['organizer']    = array( 'OrganizerID' => array_map( 'intval', (array) $p['organizer'] ) ); }
+	if ( $dates_change && ! $has( 'start_date' ) ) {
+		// TEC re-derives dates from the args it gets; keep the existing ones explicit so a
+		// timezone/all-day change can't shift them.
+		$args['EventStartDate']   = substr( (string) $before['start_date'], 0, 10 );
+		$args['EventEndDate']     = substr( (string) $before['end_date'], 0, 10 );
+		$args['EventStartHour']   = substr( (string) $before['start_date'], 11, 2 );
+		$args['EventStartMinute'] = substr( (string) $before['start_date'], 14, 2 );
+		$args['EventEndHour']     = substr( (string) $before['end_date'], 11, 2 );
+		$args['EventEndMinute']   = substr( (string) $before['end_date'], 14, 2 );
+	}
+
+	$would = array();
+	foreach ( $given as $k ) {
+		$would[ $k ] = $p[ $k ];
+	}
+	$dry = filter_var( $req->get_param( 'dry_run' ), FILTER_VALIDATE_BOOLEAN );
+	if ( $dry || ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array(
+			'dry_run'          => true,
+			'note'             => $dry ? 'dry_run=true — nothing written' : 'confirm=true was not passed — nothing written',
+			'post_id'          => $post_id,
+			'slug'             => get_post_field( 'post_name', $post_id ),
+			'is_recurring'     => $is_recurring,
+			'occurrence_count' => is_array( $occ_before ) ? count( $occ_before ) : null,
+			'before'           => array_intersect_key( $before, $would + array( 'start_date' => 1, 'end_date' => 1 ) ),
+			'would_set'        => $would,
+			'tec_args'         => $args,
+			'warning'          => $is_recurring ? 'Recurring series: _EventRecurrence is snapshotted and restored if the update drops it; occurrence counts are compared before/after.' : null,
+		) );
+	}
+
+	$check = bsb_events_require_tec();
+	if ( is_wp_error( $check ) ) {
+		return $check;
+	}
+	$restored = false;
+	if ( $args ) {
+		$ok = tribe_update_event( $post_id, $args );
+		if ( ! $ok ) {
+			return new WP_Error( 'bsb_update_failed', 'tribe_update_event() returned falsy — nothing else was applied', array( 'status' => 500 ) );
+		}
+		if ( $is_recurring && $before['recurrence'] && get_post_meta( $post_id, '_EventRecurrence', true ) != $before['recurrence'] ) {
+			update_post_meta( $post_id, '_EventRecurrence', $before['recurrence'] );
+			$restored = true;
+		}
+	}
+	if ( $has( 'categories' ) )     { wp_set_object_terms( $post_id, array_map( 'intval', (array) $p['categories'] ), 'tribe_events_cat' ); }
+	if ( $has( 'tags' ) )           { wp_set_object_terms( $post_id, array_map( 'intval', (array) $p['tags'] ), 'post_tag' ); }
+	if ( $has( 'featured_media' ) ) {
+		if ( (int) $p['featured_media'] ) { set_post_thumbnail( $post_id, (int) $p['featured_media'] ); } else { delete_post_thumbnail( $post_id ); }
+	}
+	$acf_note = null;
+	if ( $has( 'acf' ) ) {
+		if ( ! function_exists( 'update_field' ) ) {
+			$acf_note = 'ACF not active — acf values were NOT written';
+		} else {
+			foreach ( (array) $p['acf'] as $name => $value ) {
+				update_field( (string) $name, $value, $post_id );
+			}
+		}
+	}
+	clean_post_cache( $post_id );
+
+	list( $occ_after, , $waited ) = bsb_events_settle( $post_id, is_array( $occ_before ) ? wp_list_pluck( $occ_before, 'date' ) : array() );
+	$after   = $snapshot();
+	$changed = array();
+	foreach ( $after as $k => $v ) {
+		if ( $k !== 'recurrence' && $v != $before[ $k ] ) {
+			$changed[] = $k;
+		}
+	}
+	$n_before = is_array( $occ_before ) ? count( $occ_before ) : null;
+	$n_after  = is_array( $occ_after ) ? count( $occ_after ) : null;
+	return rest_ensure_response( array(
+		'updated'                 => true,
+		'post_id'                 => $post_id,
+		'slug'                    => get_post_field( 'post_name', $post_id ),
+		'permalink'               => get_permalink( $post_id ),
+		'changed'                 => $changed,
+		'before'                  => array_diff_key( $before, array( 'recurrence' => 1 ) ),
+		'after'                   => array_diff_key( $after, array( 'recurrence' => 1 ) ),
+		'is_recurring'            => $is_recurring,
+		'occurrence_count_before' => $n_before,
+		'occurrence_count_after'  => $n_after,
+		'recurrence_restored'     => $restored,
+		'settled_after_ms'        => $waited,
+		'acf_note'                => $acf_note,
+		'warning'                 => ( $is_recurring && $n_before !== null && $n_after !== null && $n_before !== $n_after && ! $dates_change )
+			? 'Occurrence count changed on a non-date edit — TEC may still be regenerating; re-check GET /events/{ref}/occurrences before assuming damage.'
+			: null,
+	) );
+}
+
 /** PUT /events/{ref}/recurrence — replace rule + exclusions on an existing series. */
 function bsb_events_put_recurrence( WP_REST_Request $req ) {
 	$dry = filter_var( $req->get_param( 'dry_run' ), FILTER_VALIDATE_BOOLEAN );
@@ -1979,11 +2204,161 @@ function bsb_redirects_serve() {
 	if ( bsb_redirects_is_self( $target, $path ) ) {
 		return;
 	}
+	bsb_redirects_record_hit( $hit['rule'] );
 	nocache_headers();
 	wp_redirect( $target, $hit['status'], 'Bethany Site Bridge' );
 	exit;
 }
 add_action( 'template_redirect', 'bsb_redirects_serve', 0 );
+
+/* ---------- stats + nested-404 rescue (0.11.0) ---------------------- *
+ *
+ * STATS answer "is anything still using this old URL, and from where?" — the
+ * question that couldn't be answered on 2026-09-03 when a dead footer link turned
+ * up with no way to trace its source. Kept in a SEPARATE option (`bsb_redirects_stats`)
+ * so the rules option stays a clean, hand-editable config. Hits are counted in the
+ * object cache and persisted at most once per 10 minutes per key, so a hot legacy
+ * URL costs one option write per 10 minutes, not per request. Referers are stored
+ * as scheme+host+path (no query), truncated.
+ *
+ * RESCUE: a multi-segment 404 whose LAST segment is the slug of exactly one
+ * published page or post is 301'd to that post — the moved-parent case that
+ * produced this whole module. WordPress's own guess never does this for nested
+ * paths. One unambiguous match only; anything else is left as a 404. Every rescue
+ * is logged (path → post) so a permanent rule can be written for it later. Off
+ * switch: option `bsb_redirects_settings` = {"rescue": false} (PUT /options).
+ */
+
+const BSB_REDIRECTS_STATS_OPTION    = 'bsb_redirects_stats';
+const BSB_REDIRECTS_SETTINGS_OPTION = 'bsb_redirects_settings';
+const BSB_REDIRECTS_STATS_TTL       = 600; // seconds between persists per key
+
+function bsb_redirects_settings() {
+	$raw  = bsb_option_read( BSB_REDIRECTS_SETTINGS_OPTION );
+	$data = $raw !== '' ? json_decode( $raw, true ) : array();
+	$data = is_array( $data ) ? $data : array();
+	return array( 'rescue' => array_key_exists( 'rescue', $data ) ? (bool) $data['rescue'] : true );
+}
+
+function bsb_redirects_stats() {
+	$raw  = bsb_option_read( BSB_REDIRECTS_STATS_OPTION );
+	$data = $raw !== '' ? json_decode( $raw, true ) : array();
+	if ( ! is_array( $data ) ) {
+		$data = array();
+	}
+	return array_merge( array( 'rules' => array(), 'rescues' => array(), 'rescued_paths' => array() ), $data );
+}
+
+/** scheme://host/path of the referer, or '' — never the query string. */
+function bsb_redirects_referer() {
+	if ( empty( $_SERVER['HTTP_REFERER'] ) ) {
+		return '';
+	}
+	$r = (string) wp_unslash( $_SERVER['HTTP_REFERER'] );
+	$p = wp_parse_url( $r );
+	if ( ! is_array( $p ) || empty( $p['host'] ) ) {
+		return '';
+	}
+	return substr( ( isset( $p['scheme'] ) ? $p['scheme'] : 'https' ) . '://' . $p['host'] . ( isset( $p['path'] ) ? $p['path'] : '/' ), 0, 200 );
+}
+
+/**
+ * Count one hit on $key (a rule path, or "rescue:" . path). Persists to the option
+ * when this key hasn't been persisted for BSB_REDIRECTS_STATS_TTL seconds.
+ */
+function bsb_redirects_record_hit( $key, array $extra = array() ) {
+	$ck  = 'bsb_rd_hits_' . md5( $key );
+	$lk  = 'bsb_rd_last_' . md5( $key );
+	$ref = bsb_redirects_referer();
+
+	$n = wp_cache_get( $ck, 'bsb' );
+	$n = ( $n === false ? 0 : (int) $n ) + 1;
+	wp_cache_set( $ck, $n, 'bsb', 3600 );
+	if ( $ref !== '' ) {
+		wp_cache_set( $ck . '_ref', $ref, 'bsb', 3600 );
+	}
+	if ( wp_cache_get( $lk, 'bsb' ) !== false ) {
+		return; // persisted recently — the counter keeps accumulating in cache
+	}
+
+	$stats  = bsb_redirects_stats();
+	$bucket = strpos( $key, 'rescue:' ) === 0 ? 'rescued_paths' : 'rules';
+	$k      = strpos( $key, 'rescue:' ) === 0 ? substr( $key, 7 ) : $key;
+	$row    = isset( $stats[ $bucket ][ $k ] ) && is_array( $stats[ $bucket ][ $k ] ) ? $stats[ $bucket ][ $k ] : array( 'hits' => 0 );
+	$row['hits']     = (int) $row['hits'] + $n;
+	$row['last_hit'] = current_time( 'c' );
+	$last_ref        = wp_cache_get( $ck . '_ref', 'bsb' );
+	if ( is_string( $last_ref ) && $last_ref !== '' ) {
+		$row['last_referer'] = $last_ref;
+		$row['referers']     = isset( $row['referers'] ) && is_array( $row['referers'] ) ? $row['referers'] : array();
+		if ( ! in_array( $last_ref, $row['referers'], true ) ) {
+			array_unshift( $row['referers'], $last_ref );
+			$row['referers'] = array_slice( $row['referers'], 0, 10 );
+		}
+	}
+	foreach ( $extra as $ek => $ev ) {
+		$row[ $ek ] = $ev;
+	}
+	$stats[ $bucket ][ $k ] = $row;
+	if ( $bucket === 'rescued_paths' ) {
+		// Newest-first log of the last 50 distinct rescues, for writing permanent rules.
+		$stats['rescues'] = array_values( array_filter( (array) $stats['rescues'], function ( $r ) use ( $k ) {
+			return ! ( is_array( $r ) && isset( $r['path'] ) && $r['path'] === $k );
+		} ) );
+		array_unshift( $stats['rescues'], array_merge( array( 'path' => $k ), $extra, array( 'at' => $row['last_hit'], 'hits' => $row['hits'] ) ) );
+		$stats['rescues'] = array_slice( $stats['rescues'], 0, 50 );
+	}
+	bsb_option_write( BSB_REDIRECTS_STATS_OPTION, wp_json_encode( $stats, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ) );
+	wp_cache_set( $ck, 0, 'bsb', 3600 );
+	wp_cache_set( $lk, 1, 'bsb', BSB_REDIRECTS_STATS_TTL );
+}
+
+/** Exactly one published page/post whose slug is $slug, or null. */
+function bsb_redirects_unique_post_for_slug( $slug ) {
+	global $wpdb;
+	$slug = sanitize_title( $slug );
+	if ( $slug === '' ) {
+		return null;
+	}
+	$ids = $wpdb->get_col( $wpdb->prepare(
+		"SELECT ID FROM {$wpdb->posts} WHERE post_name = %s AND post_status = 'publish' AND post_type IN ('page','post') LIMIT 2",
+		$slug
+	) );
+	return count( $ids ) === 1 ? (int) $ids[0] : null;
+}
+
+function bsb_redirects_rescue() {
+	if ( ! is_404() || empty( $_SERVER['REQUEST_URI'] ) ) {
+		return;
+	}
+	$settings = bsb_redirects_settings();
+	if ( ! $settings['rescue'] ) {
+		return;
+	}
+	$uri   = (string) wp_unslash( $_SERVER['REQUEST_URI'] );
+	$path  = bsb_redirects_normalize_path( (string) parse_url( $uri, PHP_URL_PATH ) );
+	$query = (string) parse_url( $uri, PHP_URL_QUERY );
+	$segs  = array_values( array_filter( explode( '/', $path ) ) );
+	if ( count( $segs ) < 2 ) {
+		return; // single segment: WordPress's own guess already had its chance
+	}
+	$post_id = bsb_redirects_unique_post_for_slug( end( $segs ) );
+	if ( ! $post_id ) {
+		return;
+	}
+	$target = get_permalink( $post_id );
+	if ( ! $target || bsb_redirects_is_self( $target, $path ) ) {
+		return;
+	}
+	if ( $query !== '' && strpos( $target, '?' ) === false ) {
+		$target .= '?' . $query;
+	}
+	bsb_redirects_record_hit( 'rescue:' . $path, array( 'to' => get_permalink( $post_id ), 'post_id' => $post_id ) );
+	nocache_headers();
+	wp_redirect( $target, 301, 'Bethany Site Bridge (rescue)' );
+	exit;
+}
+add_action( 'template_redirect', 'bsb_redirects_rescue', 1 );
 
 /** The post a rule would shadow (a real page at that path), or null. Prefix rules probe the parent. */
 function bsb_redirects_shadows( $path ) {
@@ -2034,11 +2409,19 @@ function bsb_redirects_validate( $path, $to, $status ) {
 /** GET /redirects — every rule; ?resolve=/some/path also reports what that path would do. */
 function bsb_redirects_list( WP_REST_Request $req ) {
 	$rules = bsb_redirects_all( true );
+	$stats = bsb_redirects_stats();
 	$out   = array();
 	foreach ( $rules as $path => $r ) {
-		$out[] = array_merge( array( 'path' => $path ), $r );
+		$st    = isset( $stats['rules'][ $path ] ) ? $stats['rules'][ $path ] : array( 'hits' => 0 );
+		$out[] = array_merge( array( 'path' => $path ), $r, array( 'stats' => $st ) );
 	}
-	$resp = array( 'count' => count( $out ), 'rules' => $out );
+	$resp = array(
+		'count'          => count( $out ),
+		'rules'          => $out,
+		'rescue_enabled' => bsb_redirects_settings()['rescue'],
+		'rescues'        => $stats['rescues'],
+		'stats_note'     => 'hits persist at most every ' . BSB_REDIRECTS_STATS_TTL . 's per path, so counts lag by up to that; referers are host+path only',
+	);
 
 	$probe = $req->get_param( 'resolve' );
 	if ( $probe !== null && $probe !== '' ) {
@@ -2114,6 +2497,371 @@ function bsb_redirects_delete( WP_REST_Request $req ) {
 		return new WP_Error( 'bsb_write_failed', 'The option row still holds the rule after writing — it is NOT removed.', array( 'status' => 500 ) );
 	}
 	return rest_ensure_response( array( 'removed' => true, 'persisted' => true, 'path' => $path, 'rule' => $removed, 'remaining' => count( $rules ) ) );
+}
+
+/* ================================================================== *
+ * MODULE: content — find and replace across posts, meta and options
+ * ================================================================== *
+ *
+ * Core's ?search= only sees post content. The places a URL or a phrase actually
+ * hides on this site are post META (Cornerstone stores every page's builder
+ * layout as a JSON string in _cornerstone_data; menus keep their URLs in
+ * _menu_item_url) and OPTIONS (widgets, plugin settings, redirect lists). On
+ * 2026-09-03 a dead legacy link could not be located anywhere on the site
+ * because none of those were searchable. This module is that search, plus the
+ * replace the 2026-08 domain move needed.
+ *
+ * Two things a naive str_replace gets wrong, both handled here:
+ *   - SERIALIZED values (most plugin options, ACF arrays). Replacing text inside a
+ *     PHP-serialized string changes its length and corrupts the whole value. The
+ *     value is unserialized, walked, and re-serialized instead.
+ *   - JSON-ESCAPED slashes. Cornerstone's builder JSON stores "/contact/x" as
+ *     "\/contact\/x", so a search for the plain path misses it. When the needle
+ *     contains "/", its escaped twin is searched (and replaced) as well.
+ *
+ * Replace is confirm=true with a dry run that lists every row it would touch and
+ * the occurrence count in each; it refuses needles under 4 characters and caps the
+ * rows per call (default 200) so a broad needle can't run away.
+ */
+
+function bsb_content_areas( $in ) {
+	$all = array( 'posts', 'meta', 'options' );
+	if ( ! is_array( $in ) ) {
+		$in = $in === null || $in === '' ? $all : array_map( 'trim', explode( ',', (string) $in ) );
+	}
+	return array_values( array_intersect( $all, array_map( 'strval', $in ) ) );
+}
+
+function bsb_content_snippet( $haystack, $needle, $radius = 60 ) {
+	$pos = stripos( $haystack, $needle );
+	if ( $pos === false ) {
+		return null;
+	}
+	$start = max( 0, $pos - $radius );
+	$snip  = substr( $haystack, $start, strlen( $needle ) + 2 * $radius );
+	return ( $start > 0 ? '…' : '' ) . $snip . ( $start + strlen( $snip ) < strlen( $haystack ) ? '…' : '' );
+}
+
+/** The needle and, when it carries a slash, its JSON-escaped twin. */
+function bsb_content_needles( $text ) {
+	$n = array( $text );
+	if ( strpos( $text, '/' ) !== false ) {
+		$n[] = str_replace( '/', '\/', $text );
+	}
+	return $n;
+}
+
+/** Recursive, type-preserving replace through arrays/objects; returns [value, count]. */
+function bsb_content_replace_deep( $value, array $from, array $to ) {
+	$count = 0;
+	if ( is_string( $value ) ) {
+		$value = str_replace( $from, $to, $value, $c );
+		return array( $value, (int) $c );
+	}
+	if ( is_array( $value ) ) {
+		foreach ( $value as $k => $v ) {
+			list( $value[ $k ], $c ) = bsb_content_replace_deep( $v, $from, $to );
+			$count += $c;
+		}
+		return array( $value, $count );
+	}
+	if ( is_object( $value ) ) {
+		foreach ( get_object_vars( $value ) as $k => $v ) {
+			list( $value->$k, $c ) = bsb_content_replace_deep( $v, $from, $to );
+			$count += $c;
+		}
+		return array( $value, $count );
+	}
+	return array( $value, 0 );
+}
+
+/** Replace inside a raw DB string that may be serialized; returns [new_raw, count]. */
+function bsb_content_replace_raw( $raw, array $from, array $to ) {
+	if ( is_serialized( $raw ) ) {
+		$data = @unserialize( $raw );
+		if ( $data !== false || $raw === 'b:0;' ) {
+			list( $data, $c ) = bsb_content_replace_deep( $data, $from, $to );
+			return array( serialize( $data ), $c );
+		}
+	}
+	$new = str_replace( $from, $to, $raw, $c );
+	return array( $new, (int) $c );
+}
+
+function bsb_content_count( $raw, array $needles ) {
+	$n = 0;
+	foreach ( $needles as $needle ) {
+		$n += substr_count( $raw, $needle );
+	}
+	return $n;
+}
+
+/**
+ * Every row containing any needle, per area. Shared by find and replace so the
+ * dry run and the write see the same rows.
+ */
+function bsb_content_scan( $text, array $areas, $post_type, $limit ) {
+	global $wpdb;
+	$needles = bsb_content_needles( $text );
+	$likes   = array();
+	foreach ( $needles as $n ) {
+		$likes[] = '%' . $wpdb->esc_like( $n ) . '%';
+	}
+	$rows = array( 'posts' => array(), 'meta' => array(), 'options' => array() );
+	$truncated = array();
+
+	if ( in_array( 'posts', $areas, true ) ) {
+		$where = array();
+		$args  = array();
+		foreach ( $likes as $l ) {
+			$where[] = '(post_content LIKE %s OR post_title LIKE %s OR post_excerpt LIKE %s)';
+			array_push( $args, $l, $l, $l );
+		}
+		$type_sql = "post_type NOT IN ('revision','auto-draft','oembed_cache','customize_changeset')";
+		if ( $post_type ) {
+			$type_sql = 'post_type = %s';
+			$args[]   = $post_type;
+		}
+		$args[] = $limit + 1;
+		$res    = $wpdb->get_results( $wpdb->prepare(
+			"SELECT ID, post_type, post_status, post_title, post_name, post_content, post_excerpt FROM {$wpdb->posts}
+			 WHERE (" . implode( ' OR ', $where ) . ") AND $type_sql AND post_status <> 'trash' ORDER BY ID DESC LIMIT %d",
+			$args
+		), ARRAY_A );
+		if ( count( $res ) > $limit ) {
+			$truncated[] = 'posts';
+			$res = array_slice( $res, 0, $limit );
+		}
+		foreach ( $res as $r ) {
+			$fields = array();
+			foreach ( array( 'post_title', 'post_content', 'post_excerpt' ) as $f ) {
+				$c = bsb_content_count( (string) $r[ $f ], $needles );
+				if ( $c ) {
+					$fields[ $f ] = $c;
+				}
+			}
+			$rows['posts'][] = array(
+				'id'      => (int) $r['ID'],
+				'type'    => $r['post_type'],
+				'status'  => $r['post_status'],
+				'title'   => $r['post_title'],
+				'slug'    => $r['post_name'],
+				'link'    => get_permalink( (int) $r['ID'] ),
+				'fields'  => $fields,
+				'snippet' => bsb_content_snippet( (string) $r['post_content'], $needles[0] ) ?: bsb_content_snippet( (string) $r['post_content'], end( $needles ) ),
+			);
+		}
+	}
+
+	if ( in_array( 'meta', $areas, true ) ) {
+		$where = array();
+		$args  = array();
+		foreach ( $likes as $l ) {
+			$where[] = 'm.meta_value LIKE %s';
+			$args[]  = $l;
+		}
+		$type_sql = "p.post_type NOT IN ('revision','auto-draft')";
+		if ( $post_type ) {
+			$type_sql = 'p.post_type = %s';
+			$args[]   = $post_type;
+		}
+		$args[] = $limit + 1;
+		$res    = $wpdb->get_results( $wpdb->prepare(
+			"SELECT m.meta_id, m.post_id, m.meta_key, m.meta_value, p.post_type, p.post_title FROM {$wpdb->postmeta} m
+			 INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id
+			 WHERE (" . implode( ' OR ', $where ) . ") AND $type_sql AND m.meta_key NOT IN ('_edit_lock','_edit_last')
+			 ORDER BY m.post_id DESC, m.meta_id ASC LIMIT %d",
+			$args
+		), ARRAY_A );
+		if ( count( $res ) > $limit ) {
+			$truncated[] = 'meta';
+			$res = array_slice( $res, 0, $limit );
+		}
+		foreach ( $res as $r ) {
+			$rows['meta'][] = array(
+				'meta_id'     => (int) $r['meta_id'],
+				'post_id'     => (int) $r['post_id'],
+				'post_type'   => $r['post_type'],
+				'post_title'  => $r['post_title'],
+				'key'         => $r['meta_key'],
+				'occurrences' => bsb_content_count( (string) $r['meta_value'], $needles ),
+				'serialized'  => is_serialized( $r['meta_value'] ),
+				'bytes'       => strlen( (string) $r['meta_value'] ),
+				'snippet'     => bsb_content_snippet( (string) $r['meta_value'], $needles[0] ) ?: bsb_content_snippet( (string) $r['meta_value'], end( $needles ) ),
+			);
+		}
+	}
+
+	if ( in_array( 'options', $areas, true ) ) {
+		$where = array();
+		$args  = array();
+		foreach ( $likes as $l ) {
+			$where[] = 'option_value LIKE %s';
+			$args[]  = $l;
+		}
+		$args[] = $limit + 1;
+		$res    = $wpdb->get_results( $wpdb->prepare(
+			"SELECT option_name, option_value FROM {$wpdb->options}
+			 WHERE (" . implode( ' OR ', $where ) . ") AND option_name NOT LIKE '\_transient\_%%' AND option_name NOT LIKE '\_site\_transient\_%%'
+			 ORDER BY option_name LIMIT %d",
+			$args
+		), ARRAY_A );
+		if ( count( $res ) > $limit ) {
+			$truncated[] = 'options';
+			$res = array_slice( $res, 0, $limit );
+		}
+		foreach ( $res as $r ) {
+			$secret = bsb_options_is_secret( $r['option_name'] );
+			$rows['options'][] = array(
+				'name'        => $r['option_name'],
+				'occurrences' => bsb_content_count( (string) $r['option_value'], $needles ),
+				'serialized'  => is_serialized( $r['option_value'] ),
+				'bytes'       => strlen( (string) $r['option_value'] ),
+				'writable'    => ! $secret && ! in_array( $r['option_name'], bsb_options_blocked_write(), true ),
+				'snippet'     => $secret ? '(credential-looking name — content withheld)' : ( bsb_content_snippet( (string) $r['option_value'], $needles[0] ) ?: bsb_content_snippet( (string) $r['option_value'], end( $needles ) ) ),
+			);
+		}
+	}
+
+	return array( 'needles' => $needles, 'rows' => $rows, 'truncated' => $truncated );
+}
+
+/** GET /content/find?text=&in=posts,meta,options&post_type=&limit= */
+function bsb_content_find( WP_REST_Request $req ) {
+	$text = (string) $req->get_param( 'text' );
+	if ( strlen( $text ) < 3 ) {
+		return new WP_Error( 'bsb_short_needle', 'Pass ?text= with at least 3 characters', array( 'status' => 400 ) );
+	}
+	$areas = bsb_content_areas( $req->get_param( 'in' ) );
+	if ( ! $areas ) {
+		return new WP_Error( 'bsb_bad_area', '"in" must be some of posts, meta, options', array( 'status' => 400 ) );
+	}
+	$limit = min( 500, max( 1, (int) ( $req->get_param( 'limit' ) ?: 50 ) ) );
+	$scan  = bsb_content_scan( $text, $areas, (string) $req->get_param( 'post_type' ), $limit );
+	return rest_ensure_response( array(
+		'text'      => $text,
+		'searched'  => $scan['needles'],
+		'counts'    => array_map( 'count', $scan['rows'] ),
+		'truncated' => $scan['truncated'],
+		'results'   => $scan['rows'],
+	) );
+}
+
+/** POST /content/replace {from, to, in?, post_type?, limit?, confirm, dry_run} */
+function bsb_content_replace( WP_REST_Request $req ) {
+	global $wpdb;
+	$from = (string) $req->get_param( 'from' );
+	$to   = (string) $req->get_param( 'to' );
+	if ( strlen( $from ) < 4 ) {
+		return new WP_Error( 'bsb_short_needle', '"from" must be at least 4 characters — anything shorter replaces far more than intended', array( 'status' => 400 ) );
+	}
+	if ( $from === $to ) {
+		return new WP_Error( 'bsb_noop', '"from" and "to" are identical', array( 'status' => 400 ) );
+	}
+	$areas = bsb_content_areas( $req->get_param( 'in' ) );
+	if ( ! $areas ) {
+		return new WP_Error( 'bsb_bad_area', '"in" must be some of posts, meta, options', array( 'status' => 400 ) );
+	}
+	$limit = min( 2000, max( 1, (int) ( $req->get_param( 'limit' ) ?: 200 ) ) );
+	$scan  = bsb_content_scan( $from, $areas, (string) $req->get_param( 'post_type' ), $limit );
+	if ( $scan['truncated'] ) {
+		return new WP_Error( 'bsb_too_many', 'More than ' . $limit . ' matching rows in: ' . implode( ', ', $scan['truncated'] ) . ' — narrow with in=/post_type= or raise limit (max 2000) deliberately', array( 'status' => 409 ) );
+	}
+	$needles_from = bsb_content_needles( $from );
+	$needles_to   = bsb_content_needles( $to );
+	if ( count( $needles_to ) !== count( $needles_from ) ) {
+		// "from" has a slash and "to" doesn't (or vice versa): map both variants of from to the plain to.
+		$needles_to = array_fill( 0, count( $needles_from ), $to );
+		if ( strpos( $to, '/' ) !== false && count( $needles_from ) === 2 ) {
+			$needles_to = array( $to, str_replace( '/', '\/', $to ) );
+		}
+	}
+
+	// Options that must not be touched are dropped from the plan, not silently rewritten.
+	$skipped = array();
+	foreach ( $scan['rows']['options'] as $i => $o ) {
+		if ( ! $o['writable'] ) {
+			$skipped[] = $o['name'];
+			unset( $scan['rows']['options'][ $i ] );
+		}
+	}
+	$scan['rows']['options'] = array_values( $scan['rows']['options'] );
+	$total = array_map( 'count', $scan['rows'] );
+
+	$dry = filter_var( $req->get_param( 'dry_run' ), FILTER_VALIDATE_BOOLEAN );
+	if ( $dry || ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array(
+			'dry_run'         => true,
+			'note'            => $dry ? 'dry_run=true — nothing written' : 'confirm=true was not passed — nothing written',
+			'from'            => $from,
+			'to'              => $to,
+			'searched'        => $needles_from,
+			'would_touch'     => $total,
+			'skipped_options' => $skipped,
+			'plan'            => $scan['rows'],
+		) );
+	}
+
+	$done = array( 'posts' => array(), 'meta' => array(), 'options' => array() );
+	foreach ( $scan['rows']['posts'] as $p ) {
+		$row = $wpdb->get_row( $wpdb->prepare( "SELECT post_title, post_content, post_excerpt FROM {$wpdb->posts} WHERE ID = %d", $p['id'] ), ARRAY_A );
+		if ( ! $row ) {
+			continue;
+		}
+		$upd = array();
+		$c   = 0;
+		foreach ( $row as $f => $v ) {
+			$new = str_replace( $needles_from, $needles_to, (string) $v, $cc );
+			if ( $cc ) {
+				$upd[ $f ] = $new;
+				$c        += $cc;
+			}
+		}
+		if ( $upd ) {
+			$wpdb->update( $wpdb->posts, $upd, array( 'ID' => $p['id'] ) );
+			clean_post_cache( $p['id'] );
+		}
+		$done['posts'][] = array( 'id' => $p['id'], 'title' => $p['title'], 'replaced' => $c, 'fields' => array_keys( $upd ) );
+	}
+	foreach ( $scan['rows']['meta'] as $m ) {
+		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_id = %d", $m['meta_id'] ) );
+		if ( $raw === null ) {
+			continue;
+		}
+		list( $new, $c ) = bsb_content_replace_raw( (string) $raw, $needles_from, $needles_to );
+		if ( $c && $new !== $raw ) {
+			$wpdb->update( $wpdb->postmeta, array( 'meta_value' => $new ), array( 'meta_id' => $m['meta_id'] ) );
+			wp_cache_delete( $m['post_id'], 'post_meta' );
+		}
+		$done['meta'][] = array( 'meta_id' => $m['meta_id'], 'post_id' => $m['post_id'], 'key' => $m['key'], 'replaced' => $c );
+	}
+	foreach ( $scan['rows']['options'] as $o ) {
+		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $o['name'] ) );
+		if ( $raw === null ) {
+			continue;
+		}
+		list( $new, $c ) = bsb_content_replace_raw( (string) $raw, $needles_from, $needles_to );
+		if ( $c && $new !== $raw ) {
+			$wpdb->update( $wpdb->options, array( 'option_value' => $new ), array( 'option_name' => $o['name'] ) );
+			wp_cache_delete( $o['name'], 'options' );
+			wp_cache_delete( 'alloptions', 'options' );
+		}
+		$done['options'][] = array( 'name' => $o['name'], 'replaced' => $c );
+	}
+
+	// Read back: anything still matching is a row this pass could not rewrite.
+	$after = bsb_content_scan( $from, $areas, (string) $req->get_param( 'post_type' ), $limit );
+	$left  = array_map( 'count', $after['rows'] );
+	return rest_ensure_response( array(
+		'replaced'        => true,
+		'from'            => $from,
+		'to'              => $to,
+		'touched'         => array_map( 'count', $done ),
+		'skipped_options' => $skipped,
+		'still_matching'  => $left,
+		'details'         => $done,
+		'note'            => 'Rows were written directly (no save hooks fired). Run POST /site/purge-cache so the public pages re-render.',
+	) );
 }
 
 /* ================================================================== *

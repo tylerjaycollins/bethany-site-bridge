@@ -15,7 +15,8 @@ reason to hide it; not intended as a general-purpose plugin.
 | `meta` | Read/write arbitrary post meta — the escape hatch for ACF fields and plugin meta in no REST whitelist |
 | `options` | Read/write/delete `wp_options` the same way — plugin settings, redirect lists, anything a settings screen owns. Blocklist for site-critical options; credential-looking names refused for read and write |
 | `events` | The Events Calendar **recurring** events, including **"will not occur"** exclusion dates |
-| `redirects` | Path → URL redirects managed over REST — legacy URLs after a page move, including the nested paths WordPress's own 404 guess can't rescue. Exact and `/*` prefix rules |
+| `redirects` | Path → URL redirects managed over REST — legacy URLs after a page move, including the nested paths WordPress's own 404 guess can't rescue. Exact and `/*` prefix rules, per-rule hit/referer stats, and a nested-404 rescue (a multi-segment 404 whose last segment is exactly one published page/post's slug is 301'd there; off via option `bsb_redirects_settings` `{"rescue":false}`) |
+| `content` | Find text across post content, post meta (Cornerstone builder JSON included — JSON-escaped slashes are searched too) and options; serialized-safe replace with a dry run listing every row |
 | `updater` | One-click updates from this repo's releases |
 
 ### Why the events module exists
@@ -68,6 +69,9 @@ Base: `<site>/wp-json/atlas/v1`
 | `GET /redirects` | Every redirect rule; `?resolve=/some/path` reports what that path would do |
 | `PUT /redirects` | Add or replace a rule `{path, to, status?, note?}`. Requires `confirm=true`; returns before/after, the page it would shadow, and a worked example. `path` ending in `/*` is a prefix rule; a `*` at the end of `to` carries the remainder |
 | `DELETE /redirects` | Remove a rule `{path}`. Requires `confirm=true` |
+| `GET /content/find` | `?text=&in=posts,meta,options&post_type=&limit=` — every row containing the text, with snippets |
+| `POST /content/replace` | `{from, to, in?, post_type?, limit?}` serialized-safe replace. Requires `confirm=true`; the dry run is the exact plan. Refuses needles under 4 chars and more rows than `limit` (default 200) |
+| `PUT /events/{ref}` | Edit an event's ordinary fields (title, description, dates, venue, organizer, website, cost, terms, thumbnail, ACF). Only the fields passed change; recurrence is snapshotted and restored; dates on a recurring series need `apply_to=series` + `expected_count`. Requires `confirm=true` |
 
 `{ref}` = post ID, TEC provisional occurrence ID, or slug. **Prefer the slug** — it
 always resolves to the parent post.
