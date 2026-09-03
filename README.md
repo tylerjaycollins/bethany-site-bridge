@@ -13,6 +13,7 @@ reason to hide it; not intended as a general-purpose plugin.
 |---|---|
 | `site` | Read-only introspection: WP/PHP versions, active plugins, theme, post types, taxonomies, registered meta, capability report |
 | `meta` | Read/write arbitrary post meta — the escape hatch for ACF fields and plugin meta in no REST whitelist |
+| `options` | Read/write/delete `wp_options` the same way — plugin settings, redirect lists, anything a settings screen owns. Blocklist for site-critical options; credential-looking names refused for read and write |
 | `events` | The Events Calendar **recurring** events, including **"will not occur"** exclusion dates |
 | `redirects` | Path → URL redirects managed over REST — legacy URLs after a page move, including the nested paths WordPress's own 404 guess can't rescue. Exact and `/*` prefix rules |
 | `updater` | One-click updates from this repo's releases |
@@ -51,6 +52,13 @@ Base: `<site>/wp-json/atlas/v1`
 | | |
 |---|---|
 | `GET /site` | Environment + capability report. `?meta_for=<post_type>` lists that type's registered meta keys; `?refresh_update=1` bypasses the manifest cache |
+| `POST /site/update-plugin` | Install an update WordPress is already offering (`{plugin?, confirm}`; defaults to this plugin). The last manual step in a release, gone |
+| `POST /site/purge-cache` | Clear the `page` / `static` / `object` / `opcache` layers (`{layers?}`); reports per layer what was cleared. `probe=1` lists the cache machinery present without clearing |
+| `POST /site/flush-rewrites` | Settings → Permalinks → Save, over REST |
+| `GET /options?search=` | Option names matching a term (no transients), with size and read/write flags |
+| `GET /options/{name}` | One option, unserialized |
+| `PUT /options/{name}` | Write `{value}` (any JSON). Requires `confirm=true`; before/after read back from the row |
+| `DELETE /options/{name}` | Requires `confirm=true` |
 | `GET /meta/{ref}` | All post meta, or `?keys=a,b`. Serialized values unpacked |
 | `PUT /meta/{ref}` | Write meta. Requires `confirm=true`; returns before/after |
 | `POST /events` | Create an event, optionally recurring |

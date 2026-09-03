@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.9.3
+ * Version:     0.10.0
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -28,6 +28,9 @@
  *             running" without guessing through REST probes.
  *   meta    — read/write arbitrary post meta. The escape hatch for ACF fields and
  *             plugin meta that isn't in any REST whitelist.
+ *   options — read/write/delete wp_options the same way (plugin settings, redirect
+ *             lists, anything a settings screen owns), with a blocklist for the
+ *             options that can take the site down or leak a secret.
  *   events  — The Events Calendar RECURRING events + "will not occur" exclusions.
  *   redirects — path → URL redirects managed over REST (legacy URLs after a
  *             page move; the nested paths WordPress's own 404 guess can't rescue).
@@ -66,6 +69,13 @@
  *   GET  /site                      → environment + capability report
  *   POST /site/check-updates        → force core's plugin update check (see below)
  *   PUT  /site/gf-poke-token        → store the GF poke token as a WP option
+ *   POST /site/update-plugin        → install an offered plugin update (default: this plugin). confirm=true.
+ *   POST /site/purge-cache          → clear page / static / object / opcache layers; ?probe=1 lists what's there
+ *   POST /site/flush-rewrites       → the Permalinks → Save step
+ *   GET  /options?search=           → option names matching (discovery)
+ *   GET  /options/{name}            → one option, unserialized
+ *   PUT  /options/{name}            → write {value}. confirm=true; before/after
+ *   DELETE /options/{name}          → delete. confirm=true
  *   GET  /meta/{ref}                → post meta (all, or ?keys=a,b)
  *   PUT  /meta/{ref}                → write meta. Requires confirm=true.
  *   GET  /events/{ref}/recurrence   → raw _EventRecurrence + occurrence list
@@ -124,6 +134,25 @@ add_action( 'rest_api_init', function () {
 	) );
 	register_rest_route( 'atlas/v1', '/site/gf-poke-token', array(
 		array( 'methods' => 'PUT', 'callback' => 'bsb_site_put_gf_poke_token', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/site/update-plugin', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_site_update_plugin', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/site/purge-cache', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_site_purge_cache', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/site/flush-rewrites', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_site_flush_rewrites', 'permission_callback' => $auth ),
+	) );
+
+	// --- options ---
+	register_rest_route( 'atlas/v1', '/options', array(
+		array( 'methods' => 'GET', 'callback' => 'bsb_options_search', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/options/(?P<name>[^/]+)', array(
+		array( 'methods' => 'GET',    'callback' => 'bsb_options_get',    'permission_callback' => $auth ),
+		array( 'methods' => 'PUT',    'callback' => 'bsb_options_put',    'permission_callback' => $auth ),
+		array( 'methods' => 'DELETE', 'callback' => 'bsb_options_delete', 'permission_callback' => $auth ),
 	) );
 
 	// --- meta ---
@@ -614,7 +643,7 @@ function bsb_site_report( WP_REST_Request $req ) {
 		'bridge' => array(
 			'version'        => bsb_installed_version(),
 			'secret_defined' => bsb_secret() !== '',
-			'modules'        => array( 'site', 'meta', 'events', 'redirects', 'tweaks', 'updater' ),
+			'modules'        => array( 'site', 'meta', 'options', 'events', 'redirects', 'tweaks', 'updater' ),
 			'redirect_rules' => count( bsb_redirects_all() ),
 			// Where the GF poke token is coming from — never the value itself.
 			'gf_poke_token'  => ( defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '' )
@@ -631,11 +660,214 @@ function bsb_site_report( WP_REST_Request $req ) {
 			'tec_occurrences_table' => bsb_has_occurrences_table(),
 			'acf_active'            => function_exists( 'get_field' ),
 			'pretty_links_bridge'   => function_exists( 'atlas_prli_auth' ),
+			'hummingbird_page_cache'=> has_action( 'wphb_clear_page_cache' ) !== false,
+			'opcache'               => function_exists( 'opcache_reset' ),
+			'object_cache'          => wp_using_ext_object_cache(),
 		),
 		'active_plugins' => $plugins,
 		'post_types'     => $types,
 		'taxonomies'     => $taxes,
 		'registered_meta' => $exposed, // null unless ?meta_for=<post_type>
+	) );
+}
+
+
+/* ------------------------------------------------------------------ *
+ * site: operations that used to be a wp-admin click
+ * ------------------------------------------------------------------ */
+
+/**
+ * POST /site/update-plugin {plugin?, confirm} — install an update WordPress is already
+ * offering. Defaults to THIS plugin, which closes the last manual step in a release:
+ * tag → CI zip → check-updates → (this) → verify /site reports the new version.
+ *
+ * Mirrors wp-admin's own "Update now" (wp_ajax_update_plugin): refresh the update
+ * transient, require the plugin to be in `response`, then Plugin_Upgrader::bulk_upgrade()
+ * — bulk_upgrade, not upgrade(), because upgrade() deactivates the plugin first and
+ * relies on the admin page to offer re-activation, while bulk_upgrade swaps the files
+ * in place and keeps an active plugin active. Only ever installs what core is already
+ * offering; it cannot be pointed at an arbitrary zip.
+ */
+function bsb_site_update_plugin( WP_REST_Request $req ) {
+	$file = trim( (string) $req->get_param( 'plugin' ) );
+	if ( $file === '' ) {
+		$file = plugin_basename( __FILE__ );
+	}
+	if ( ! preg_match( '#^[a-z0-9_.\-]+/[a-z0-9_.\-]+\.php$#i', $file ) ) {
+		return new WP_Error( 'bsb_bad_plugin', '"plugin" must be a plugin file like folder/plugin.php', array( 'status' => 400 ) );
+	}
+	require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+	require_once ABSPATH . 'wp-admin/includes/misc.php';
+	require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+	if ( ! function_exists( 'wp_update_plugins' ) ) {
+		require_once ABSPATH . WPINC . '/update.php';
+	}
+	if ( ! file_exists( WP_PLUGIN_DIR . '/' . $file ) ) {
+		return new WP_Error( 'bsb_not_installed', "No installed plugin at $file", array( 'status' => 404 ) );
+	}
+
+	delete_site_transient( BSB_UPDATE_CACHE );
+	delete_site_transient( 'update_plugins' );
+	wp_update_plugins();
+	$transient = get_site_transient( 'update_plugins' );
+
+	$before  = get_plugin_data( WP_PLUGIN_DIR . '/' . $file, false, false );
+	$offered = ( is_object( $transient ) && isset( $transient->response[ $file ]->new_version ) )
+		? (string) $transient->response[ $file ]->new_version : null;
+	$package = ( $offered && isset( $transient->response[ $file ]->package ) ) ? (string) $transient->response[ $file ]->package : null;
+
+	$summary = array(
+		'plugin'    => $file,
+		'name'      => isset( $before['Name'] ) ? $before['Name'] : null,
+		'installed' => isset( $before['Version'] ) ? $before['Version'] : null,
+		'offered'   => $offered,
+		'package'   => $package,
+		'active'    => is_plugin_active( $file ),
+	);
+	if ( ! $offered ) {
+		return rest_ensure_response( array_merge( array( 'updated' => false, 'note' => 'WordPress is not offering an update for this plugin — nothing to install' ), $summary ) );
+	}
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array_merge( array( 'dry_run' => true, 'note' => 'confirm=true was not passed — nothing installed' ), $summary ) );
+	}
+
+	$skin     = new WP_Ajax_Upgrader_Skin();
+	$upgrader = new Plugin_Upgrader( $skin );
+	$results  = $upgrader->bulk_upgrade( array( $file ) );
+	$result   = is_array( $results ) && array_key_exists( $file, $results ) ? $results[ $file ] : null;
+
+	$errors = array();
+	foreach ( (array) $skin->get_errors()->get_error_messages() as $m ) {
+		$errors[] = (string) $m;
+	}
+	if ( is_wp_error( $result ) ) {
+		$errors[] = $result->get_error_message();
+	}
+
+	wp_clean_plugins_cache( true );
+	delete_site_transient( BSB_UPDATE_CACHE );
+	$after   = file_exists( WP_PLUGIN_DIR . '/' . $file ) ? get_plugin_data( WP_PLUGIN_DIR . '/' . $file, false, false ) : array();
+	$now     = isset( $after['Version'] ) ? $after['Version'] : null;
+	$ok      = $now !== null && $offered !== null && version_compare( $now, $offered, '>=' );
+
+	return rest_ensure_response( array_merge( array(
+		'updated'         => $ok,
+		'installed_after' => $now,
+		'active_after'    => is_plugin_active( $file ),
+		'upgrader_result' => is_wp_error( $result ) ? 'error' : ( $result === true ? 'ok' : ( $result === false ? 'false' : ( $result === null ? 'null' : 'array' ) ) ),
+		'errors'          => $errors,
+		'messages'        => array_values( array_filter( array_map( 'strval', (array) $skin->get_upgrade_messages() ) ) ),
+		'note'            => $file === plugin_basename( __FILE__ )
+			? 'Self-update: the version that answers the NEXT request is the truth — re-read GET /site.'
+			: null,
+	), $summary ) );
+}
+
+/**
+ * POST /site/purge-cache {layers?, probe?} — clear the caches that swallow REST edits.
+ *
+ * Every content change through REST has run into this: Hummingbird's page cache and
+ * the host's static server cache both keep serving the old render until someone
+ * clears them in wp-admin. Layers, each reported as cleared / unavailable:
+ *   page     Hummingbird page cache (wphb_clear_page_cache) — also fires Hummingbird's
+ *            integration hook, which on WPMU DEV hosting is what reaches the static cache
+ *   static   the hosting static server cache, via whichever Hummingbird/Dashboard API
+ *            method is present (probe=1 lists candidates without clearing anything)
+ *   object   wp_cache_flush()
+ *   opcache  opcache_reset()
+ * Default is every layer. A wrong guess here costs a re-render, so no confirm gate.
+ */
+function bsb_site_purge_cache( WP_REST_Request $req ) {
+	$all    = array( 'page', 'static', 'object', 'opcache' );
+	$want   = $req->get_param( 'layers' );
+	$layers = is_array( $want ) && $want ? array_values( array_intersect( $all, array_map( 'strval', $want ) ) ) : $all;
+	$probe  = filter_var( $req->get_param( 'probe' ), FILTER_VALIDATE_BOOLEAN );
+
+	// What cache-ish machinery is present. Cheap, read-only; drives `static` below and
+	// tells the caller what the next iteration of this endpoint should call by name.
+	$found = array(
+		'wphb_clear_page_cache_listeners' => has_action( 'wphb_clear_page_cache' ) !== false,
+		'wphb_clear_cache_url_listeners'  => has_action( 'wphb_clear_cache_url' ) !== false,
+		'hummingbird_hosting_api'         => array(),
+		'wpmudev_dashboard_api'           => array(),
+		'functions'                       => array(),
+	);
+	if ( class_exists( '\Hummingbird\Core\Utils' ) && method_exists( '\Hummingbird\Core\Utils', 'get_api' ) ) {
+		$api = \Hummingbird\Core\Utils::get_api();
+		if ( is_object( $api ) && isset( $api->hosting ) && is_object( $api->hosting ) ) {
+			$found['hummingbird_hosting_api'] = array_values( preg_grep( '/cache|purge|clear|static|fast_cgi/i', get_class_methods( $api->hosting ) ) );
+		}
+	}
+	if ( class_exists( 'WPMUDEV_Dashboard' ) && isset( \WPMUDEV_Dashboard::$api ) && is_object( \WPMUDEV_Dashboard::$api ) ) {
+		$found['wpmudev_dashboard_api'] = array_values( preg_grep( '/cache|purge|static|hosting/i', get_class_methods( \WPMUDEV_Dashboard::$api ) ) );
+	}
+	foreach ( array( 'wphb_clear_static_cache', 'wpmudev_hosting_purge_static_cache', 'wpmudev_purge_static_cache' ) as $fn ) {
+		if ( function_exists( $fn ) ) {
+			$found['functions'][] = $fn;
+		}
+	}
+	if ( $probe ) {
+		return rest_ensure_response( array( 'probe' => true, 'found' => $found, 'note' => 'nothing cleared' ) );
+	}
+
+	$done = array();
+	if ( in_array( 'page', $layers, true ) ) {
+		if ( $found['wphb_clear_page_cache_listeners'] ) {
+			do_action( 'wphb_clear_page_cache' );
+			$done['page'] = 'cleared (wphb_clear_page_cache)';
+		} else {
+			$done['page'] = 'unavailable — nothing listens on wphb_clear_page_cache (Hummingbird page caching off?)';
+		}
+	}
+	if ( in_array( 'static', $layers, true ) ) {
+		$done['static'] = 'unavailable — no static-cache purge method found; run with probe=1 and wire the named method';
+		$tried = array();
+		foreach ( $found['functions'] as $fn ) {
+			$tried[] = $fn;
+			call_user_func( $fn );
+			$done['static'] = "cleared ($fn)";
+			break;
+		}
+		if ( strpos( $done['static'], 'cleared' ) !== 0 && $found['hummingbird_hosting_api'] ) {
+			$api = \Hummingbird\Core\Utils::get_api();
+			foreach ( array( 'purge_static_cache', 'clear_static_cache', 'purge_cache', 'clear_cache', 'clear_fast_cgi_cache', 'purge_fast_cgi_cache' ) as $m ) {
+				if ( in_array( $m, $found['hummingbird_hosting_api'], true ) ) {
+					$tried[] = "hosting->$m";
+					$r = call_user_func( array( $api->hosting, $m ) );
+					$done['static'] = is_wp_error( $r ) ? "error (hosting->$m): " . $r->get_error_message() : "cleared (hosting->$m)";
+					break;
+				}
+			}
+		}
+		if ( strpos( $done['static'], 'cleared' ) !== 0 && $found['wphb_clear_cache_url_listeners'] ) {
+			do_action( 'wphb_clear_cache_url' );
+			$tried[] = 'wphb_clear_cache_url';
+			$done['static'] = 'fired wphb_clear_cache_url (Hummingbird integrations hook) — verify with a fresh GET; no direct static-cache API found';
+		}
+		$done['static_tried'] = $tried;
+	}
+	if ( in_array( 'object', $layers, true ) ) {
+		$done['object'] = wp_cache_flush() ? 'cleared (wp_cache_flush)' : 'wp_cache_flush returned false';
+	}
+	if ( in_array( 'opcache', $layers, true ) ) {
+		$done['opcache'] = function_exists( 'opcache_reset' ) ? ( @opcache_reset() ? 'cleared (opcache_reset)' : 'opcache_reset returned false (restricted?)' ) : 'unavailable';
+	}
+	return rest_ensure_response( array( 'purged' => true, 'layers' => $done, 'found' => $found ) );
+}
+
+/** POST /site/flush-rewrites — what Settings → Permalinks → Save does, without the page. */
+function bsb_site_flush_rewrites( WP_REST_Request $req ) {
+	unset( $req );
+	$before = (array) get_option( 'rewrite_rules', array() );
+	flush_rewrite_rules( false );
+	$after = (array) get_option( 'rewrite_rules', array() );
+	return rest_ensure_response( array(
+		'flushed'      => true,
+		'rules_before' => count( $before ),
+		'rules_after'  => count( $after ),
+		'added'        => array_values( array_diff( array_keys( $after ), array_keys( $before ) ) ),
+		'removed'      => array_values( array_diff( array_keys( $before ), array_keys( $after ) ) ),
 	) );
 }
 
@@ -725,9 +957,13 @@ function bsb_meta_put( WP_REST_Request $req ) {
 		) );
 	}
 
+	// wp_slash() first: update_post_meta() expects slashed input (it wp_unslash()es),
+	// and REST JSON params arrive unslashed. Without it every backslash in a value
+	// vanished on write — Cornerstone's JSON-in-a-string meta landed corrupted and the
+	// page rendered empty (found 2026-09-03).
 	$after = array();
 	foreach ( $values as $key => $value ) {
-		update_post_meta( $post_id, $key, $value );
+		update_post_meta( $post_id, $key, wp_slash( $value ) );
 		$after[ $key ] = get_post_meta( $post_id, $key, true );
 	}
 
@@ -737,6 +973,189 @@ function bsb_meta_put( WP_REST_Request $req ) {
 		'before'  => $before,
 		'after'   => $after,
 	) );
+}
+
+/* ================================================================== *
+ * MODULE: options — wp_options, the other escape hatch
+ * ================================================================== *
+ *
+ * Plugin settings screens are just options. Quick Page/Post Redirect's rule list,
+ * SmartCrawl's settings, Hummingbird toggles, TEC display options — all reachable
+ * here without a wp-admin session. Same shape as /meta: GET unserializes, PUT takes
+ * {value} (any JSON — arrays are stored serialized like WP does itself), requires
+ * confirm=true, echoes before/after read back from the option table.
+ *
+ * BLOCKLIST — two kinds. Options that can take the site down or lock everyone out
+ * are refused for write (and delete): siteurl/home, active_plugins, roles, the
+ * theme pair, admin_email, cron. Options whose NAME looks like a secret are refused
+ * for read AND write, so a listing can never leak a key through this channel; the
+ * bridge's own gf-poke token has its own endpoint for exactly that reason.
+ */
+
+function bsb_options_blocked_write() {
+	return array(
+		'siteurl', 'home', 'active_plugins', 'active_sitewide_plugins', 'template', 'stylesheet',
+		'wp_user_roles', 'admin_email', 'users_can_register', 'default_role', 'cron', 'db_version',
+		'initial_db_version', 'auto_update_core_dev', 'auto_update_core_minor', 'auto_update_core_major',
+	);
+}
+
+function bsb_options_is_secret( $name ) {
+	return (bool) preg_match( '/(secret|token|password|passwd|api_?key|private_?key|_key$|^key_|nonce|salt|(^|_)auth(_|$))/i', $name );
+}
+
+function bsb_options_name( WP_REST_Request $req ) {
+	$name = trim( (string) $req->get_param( 'name' ) );
+	if ( $name === '' || strlen( $name ) > 191 || preg_match( '/[^\w\-.:@\/]/', $name ) ) {
+		return new WP_Error( 'bsb_bad_option', 'Option name is missing or contains characters an option name never has', array( 'status' => 400 ) );
+	}
+	return $name;
+}
+
+/** Unserialize-safe read straight from the table so a poisoned cache can't lie. */
+function bsb_options_row( $name ) {
+	global $wpdb;
+	$row = $wpdb->get_row( $wpdb->prepare( "SELECT option_value, autoload FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $name ), ARRAY_A );
+	if ( ! $row ) {
+		return null;
+	}
+	return array( 'value' => maybe_unserialize( $row['option_value'] ), 'autoload' => $row['autoload'], 'bytes' => strlen( $row['option_value'] ) );
+}
+
+/** GET /options?search=term — names only (plus size and autoload), for finding the right option. */
+function bsb_options_search( WP_REST_Request $req ) {
+	global $wpdb;
+	$term = trim( (string) $req->get_param( 'search' ) );
+	if ( strlen( $term ) < 2 ) {
+		return new WP_Error( 'bsb_short_search', 'Pass ?search= with at least 2 characters', array( 'status' => 400 ) );
+	}
+	$limit = min( 200, max( 1, (int) ( $req->get_param( 'limit' ) ?: 50 ) ) );
+	$rows  = $wpdb->get_results( $wpdb->prepare(
+		"SELECT option_name, autoload, LENGTH(option_value) AS bytes FROM {$wpdb->options}
+		 WHERE option_name LIKE %s AND option_name NOT LIKE %s ORDER BY option_name LIMIT %d",
+		'%' . $wpdb->esc_like( $term ) . '%', '\_transient\_%', $limit
+	), ARRAY_A );
+	$out = array();
+	foreach ( (array) $rows as $r ) {
+		$out[] = array(
+			'name'     => $r['option_name'],
+			'autoload' => $r['autoload'],
+			'bytes'    => (int) $r['bytes'],
+			'readable' => ! bsb_options_is_secret( $r['option_name'] ),
+			'writable' => ! bsb_options_is_secret( $r['option_name'] ) && ! in_array( $r['option_name'], bsb_options_blocked_write(), true ),
+		);
+	}
+	return rest_ensure_response( array( 'count' => count( $out ), 'options' => $out, 'note' => 'transients are excluded' ) );
+}
+
+function bsb_options_get( WP_REST_Request $req ) {
+	$name = bsb_options_name( $req );
+	if ( is_wp_error( $name ) ) {
+		return $name;
+	}
+	if ( bsb_options_is_secret( $name ) ) {
+		return new WP_Error( 'bsb_secret_option', "Refusing to read \"$name\": its name looks like a credential", array( 'status' => 403 ) );
+	}
+	$row = bsb_options_row( $name );
+	return rest_ensure_response( array(
+		'name'     => $name,
+		'exists'   => $row !== null,
+		'value'    => $row ? $row['value'] : null,
+		'type'     => $row ? gettype( $row['value'] ) : null,
+		'autoload' => $row ? $row['autoload'] : null,
+		'bytes'    => $row ? $row['bytes'] : 0,
+		'writable' => ! in_array( $name, bsb_options_blocked_write(), true ),
+	) );
+}
+
+/** PUT /options/{name} {value, confirm, dry_run, autoload?} — write one option, verified against the row. */
+function bsb_options_put( WP_REST_Request $req ) {
+	$name = bsb_options_name( $req );
+	if ( is_wp_error( $name ) ) {
+		return $name;
+	}
+	if ( bsb_options_is_secret( $name ) ) {
+		return new WP_Error( 'bsb_secret_option', "Refusing to write \"$name\": its name looks like a credential — use the dedicated endpoint if one exists", array( 'status' => 403 ) );
+	}
+	if ( in_array( $name, bsb_options_blocked_write(), true ) ) {
+		return new WP_Error( 'bsb_blocked_option', "Refusing to write \"$name\": it can take the site down or lock everyone out", array( 'status' => 409 ) );
+	}
+	$params = $req->get_json_params();
+	if ( ! is_array( $params ) || ! array_key_exists( 'value', $params ) ) {
+		return new WP_Error( 'bsb_no_value', 'A JSON body with a "value" key is required (null is allowed, absence is not)', array( 'status' => 400 ) );
+	}
+	$value = $params['value'];
+	if ( is_object( $value ) ) {
+		$value = json_decode( wp_json_encode( $value ), true );
+	}
+	$before = bsb_options_row( $name );
+
+	$dry = filter_var( $req->get_param( 'dry_run' ), FILTER_VALIDATE_BOOLEAN );
+	if ( $dry || ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array(
+			'dry_run'   => true,
+			'name'      => $name,
+			'note'      => $dry ? 'dry_run=true — nothing written' : 'confirm=true was not passed — nothing written',
+			'exists'    => $before !== null,
+			'before'    => $before ? $before['value'] : null,
+			'would_set' => $value,
+		) );
+	}
+
+	wp_cache_delete( 'notoptions', 'options' );
+	wp_cache_delete( 'alloptions', 'options' );
+	wp_cache_delete( $name, 'options' );
+	$autoload = $req->get_param( 'autoload' );
+	if ( $before === null ) {
+		add_option( $name, $value, '', $autoload === null ? false : (bool) filter_var( $autoload, FILTER_VALIDATE_BOOLEAN ) );
+	} else {
+		update_option( $name, $value, $autoload === null ? null : (bool) filter_var( $autoload, FILTER_VALIDATE_BOOLEAN ) );
+	}
+	wp_cache_delete( 'notoptions', 'options' );
+	wp_cache_delete( 'alloptions', 'options' );
+	wp_cache_delete( $name, 'options' );
+	$after     = bsb_options_row( $name );
+	$persisted = $after !== null && maybe_serialize( $after['value'] ) === maybe_serialize( $value );
+	if ( ! $persisted ) {
+		return new WP_Error( 'bsb_write_failed', 'The option row does not hold the value after writing', array(
+			'status' => 500,
+			'before' => $before ? $before['value'] : null,
+			'after'  => $after ? $after['value'] : null,
+		) );
+	}
+	return rest_ensure_response( array(
+		'updated'   => true,
+		'persisted' => true,
+		'name'      => $name,
+		'created'   => $before === null,
+		'before'    => $before ? $before['value'] : null,
+		'after'     => $after['value'],
+		'autoload'  => $after['autoload'],
+	) );
+}
+
+/** DELETE /options/{name} {confirm} */
+function bsb_options_delete( WP_REST_Request $req ) {
+	$name = bsb_options_name( $req );
+	if ( is_wp_error( $name ) ) {
+		return $name;
+	}
+	if ( bsb_options_is_secret( $name ) || in_array( $name, bsb_options_blocked_write(), true ) ) {
+		return new WP_Error( 'bsb_blocked_option', "Refusing to delete \"$name\"", array( 'status' => 409 ) );
+	}
+	$before = bsb_options_row( $name );
+	if ( $before === null ) {
+		return new WP_Error( 'bsb_not_found', "No option named \"$name\"", array( 'status' => 404 ) );
+	}
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array( 'dry_run' => true, 'note' => 'confirm=true was not passed — nothing deleted', 'name' => $name, 'before' => $before['value'] ) );
+	}
+	delete_option( $name );
+	wp_cache_delete( 'notoptions', 'options' );
+	wp_cache_delete( 'alloptions', 'options' );
+	wp_cache_delete( $name, 'options' );
+	$gone = bsb_options_row( $name ) === null;
+	return rest_ensure_response( array( 'deleted' => $gone, 'persisted' => $gone, 'name' => $name, 'before' => $before['value'] ) );
 }
 
 /* ================================================================== *
