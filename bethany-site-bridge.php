@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.12.1
+ * Version:     0.12.2
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -2982,7 +2982,7 @@ function bsb_files_capabilities() {
 		'mu_plugins_writable' => is_dir( $mu ) ? wp_is_writable( $mu ) : wp_is_writable( dirname( $mu ) ),
 		'theme_dir'           => $theme,
 		'theme_writable'      => wp_is_writable( $theme ),
-		'lint'                => bsb_files_exec_available() && bsb_files_php_cli() !== '' ? 'php -l' : ( function_exists( 'opcache_compile_file' ) ? 'opcache_compile_file' : 'none' ),
+		'lint'                => bsb_files_exec_available() && bsb_files_php_cli() !== '' ? 'php -l' : ( function_exists( 'token_get_all' ) && defined( 'TOKEN_PARSE' ) ? 'token_get_all' : ( function_exists( 'opcache_compile_file' ) ? 'opcache_compile_file' : 'none' ) ),
 	);
 }
 
@@ -3043,10 +3043,25 @@ function bsb_files_lint_php( $source ) {
 			$msg = trim( str_replace( $tmp, '<file>', implode( "\n", $out ) ) );
 			return array( $code === 0, 'php -l', $msg );
 		}
+		// The tokenizer in TOKEN_PARSE mode runs the real parser without executing
+		// anything and throws ParseError on a syntax error — no exec, no opcache, no
+		// temp file needed. Available since PHP 7.0.
+		if ( function_exists( 'token_get_all' ) && defined( 'TOKEN_PARSE' ) ) {
+			try {
+				token_get_all( $source, TOKEN_PARSE );
+				return array( true, 'token_get_all', 'No syntax errors detected' );
+			} catch ( \ParseError $e ) {
+				return array( false, 'token_get_all', 'Parse error: ' . $e->getMessage() . ' on line ' . $e->getLine() );
+			} catch ( \Throwable $e ) {
+				// fall through to the next method
+			}
+		}
 		if ( function_exists( 'opcache_compile_file' ) ) {
 			try {
 				$ok = @opcache_compile_file( $tmp );
-				return array( (bool) $ok, 'opcache_compile_file', $ok ? 'No syntax errors detected' : 'opcache_compile_file returned false (opcache may be disabled for this SAPI)' );
+				// false without a ParseError means "could not compile HERE" (restricted
+				// paths, disabled for this SAPI) — indeterminate, not invalid.
+				return array( $ok ? true : null, 'opcache_compile_file', $ok ? 'No syntax errors detected' : 'opcache_compile_file returned false — lint indeterminate on this host; lint locally and pass force=true' );
 			} catch ( \ParseError $e ) {
 				return array( false, 'opcache_compile_file', 'Parse error: ' . $e->getMessage() . ' on line ' . $e->getLine() );
 			} catch ( \Throwable $e ) {

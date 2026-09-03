@@ -74,7 +74,7 @@ Base: `<site>/wp-json/atlas/v1`
 | `POST /content/replace` | `{from, to, in?, post_type?, limit?}` serialized-safe replace. Requires `confirm=true`; the dry run is the exact plan. Refuses needles under 4 chars and more rows than `limit` (default 200) |
 | `PUT /events/{ref}` | Edit an event's ordinary fields (title, description, dates, venue, organizer, website, cost, terms, thumbnail, ACF). Only the fields passed change; recurrence is snapshotted and restored; dates on a recurring series need `apply_to=series` + `expected_count`. Requires `confirm=true` |
 | `GET /files/{root}` | List files under `mu-plugins` or `theme` (no content) plus writability/lint capabilities; `?path=` reads one file: base64 content, sha1, size, declared functions. The path is a parameter, never a URL segment — the host's nginx serves any URI ending in `.php`/`.css` itself |
-| `PUT /files/{root}` | Write `{path, ...}`:  `{content_base64, expected_sha1 (required when the file exists), force?}`. Requires `confirm=true`. .php is linted first (`php -l` or `opcache_compile_file`), refused on syntax error or probable redeclaration; the previous version is backed up and its name returned |
+| `PUT /files/{root}` | Write `{path, ...}`:  `{content_base64, expected_sha1 (required when the file exists), force?}`. Requires `confirm=true`. .php is linted first (`php -l`, else `token_get_all(TOKEN_PARSE)`, else `opcache_compile_file`), refused on syntax error or probable redeclaration; the previous version is backed up and its name returned |
 | `DELETE /files/{root}` | `{path}` moves the file to backups. Requires `confirm=true` |
 | `POST /files/restore` | `{root, path, backup}` puts a backup back (current file backed up first). Requires `confirm=true` |
 
