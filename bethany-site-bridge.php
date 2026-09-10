@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.12.2
+ * Version:     0.13.0
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -39,6 +39,10 @@
  *             only sees post content), and a serialized-safe replace.
  *   files   — read/write files under wp-content/mu-plugins and the child theme:
  *             the SFTP replacement, with lint, backups and sha1-checked overwrites.
+ *   posts   — create/read/update posts of ANY post type, with ACF written
+ *             through update_field() so repeaters and their name/_name key
+ *             pairs land correctly (v0.13.0). Core REST does this only for a
+ *             logged-in user; a shared secret is not one.
  *   tweaks  — the site's custom PHP, absorbed from the Code Snippets plugin (v0.9.0)
  *             so it ships through this plugin's one-click update instead of being
  *             hand-edited in wp-admin: trip-update nested URLs (snippet #5), trip
@@ -99,6 +103,9 @@
  *   (the file path is a PARAMETER, never a URL segment: the host's nginx serves
  *    any URI ending in .php/.css itself — 403/404 — before WordPress runs)
  *   POST /files/restore             → {root, path, backup} put a backup back. confirm=true.
+ *   POST /posts                     → create {post_type,title,status?,slug?,content?,acf?,meta?,terms?}. confirm=true.
+ *   GET  /posts/{ref}               → read one back; ?full=true returns ACF values, else their shape
+ *   PUT  /posts/{ref}               → partial update; ACF repeaters replace wholesale. confirm=true.
  *
  * {ref} = post ID, TEC provisional occurrence ID, or slug. Prefer the SLUG.
  *
@@ -213,6 +220,14 @@ add_action( 'rest_api_init', function () {
 		array( 'methods' => 'GET',    'callback' => 'bsb_redirects_list',   'permission_callback' => $auth ),
 		array( 'methods' => 'PUT',    'callback' => 'bsb_redirects_put',    'permission_callback' => $auth ),
 		array( 'methods' => 'DELETE', 'callback' => 'bsb_redirects_delete', 'permission_callback' => $auth ),
+	) );
+	// --- posts ---
+	register_rest_route( 'atlas/v1', '/posts', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_posts_create', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/posts/(?P<ref>[^/]+)', array(
+		array( 'methods' => 'GET', 'callback' => 'bsb_posts_get',    'permission_callback' => $auth ),
+		array( 'methods' => 'PUT', 'callback' => 'bsb_posts_update', 'permission_callback' => $auth ),
 	) );
 } );
 
@@ -678,7 +693,7 @@ function bsb_site_report( WP_REST_Request $req ) {
 		'bridge' => array(
 			'version'        => bsb_installed_version(),
 			'secret_defined' => bsb_secret() !== '',
-			'modules'        => array( 'site', 'meta', 'options', 'events', 'redirects', 'content', 'files', 'tweaks', 'updater' ),
+			'modules'        => array( 'site', 'meta', 'options', 'events', 'redirects', 'content', 'posts', 'files', 'tweaks', 'updater' ),
 			'redirect_rules' => count( bsb_redirects_all() ),
 			// Where the GF poke token is coming from — never the value itself.
 			'gf_poke_token'  => ( defined( 'ATLAS_GF_POKE_TOKEN' ) && ATLAS_GF_POKE_TOKEN !== '' )
@@ -3313,6 +3328,392 @@ function bsb_files_restore( WP_REST_Request $req ) {
 		@opcache_invalidate( $abs, true );
 	}
 	return rest_ensure_response( array( 'restored' => true, 'root' => $root, 'path' => $rel, 'from_backup' => $name, 'replaced_backed_up_as' => $prior, 'after' => bsb_files_describe( $abs, $rel ) ) );
+}
+
+/* ================================================================== *
+ * MODULE: posts — create, read and update posts of any post type
+ * ================================================================== *
+ *
+ * Core REST creates posts, but only for a logged-in WordPress user holding
+ * the capability; this plugin's shared secret grants no such user, so a push
+ * from Atlas or Claude Code previously meant minting an application password
+ * or hand-writing meta. This module closes that gap (v0.13.0).
+ *
+ * ACF fields are written through update_field(), NOT as raw meta, so ACF
+ * itself maintains the `name` => value and `_name` => field-key pairs that
+ * the meta module makes you supply by hand. That is what makes repeaters
+ * writable here: pass acf: { articles: [ {...}, {...} ] } and ACF unrolls the
+ * rows into articles_0_*, articles_1_* with every key in place. Writing that
+ * by hand is ~16 meta entries per row and one missed `_name` leaves the field
+ * silently inert.
+ *
+ * Refuses post types that belong to another module (events) or that hold
+ * builder and plugin internals, where a blind insert corrupts more than it
+ * writes.
+ */
+
+/** Post types this module will not touch, and why. */
+function bsb_posts_blocked() {
+	return array(
+		'tribe_events'      => 'use the events module — recurrence and occurrences need it',
+		'attachment'        => 'media needs a real upload, not a post insert',
+		'revision'          => 'not a content type',
+		'acf-field'         => 'ACF storage — field groups belong in code',
+		'acf-field-group'   => 'ACF storage — field groups belong in code',
+		'acf-post-type'     => 'ACF storage — post types belong in code',
+		'acf-taxonomy'      => 'ACF storage — taxonomies belong in code',
+		'cs_template'       => 'Cornerstone layout data — edit in the builder',
+		'cs_layout'         => 'Cornerstone layout data — edit in the builder',
+		'cs_layout_single'  => 'Cornerstone layout data — edit in the builder',
+		'cs_layout_archive' => 'Cornerstone layout data — edit in the builder',
+		'cs_header'         => 'Cornerstone layout data — edit in the builder',
+		'cs_footer'         => 'Cornerstone layout data — edit in the builder',
+		'cs_global_block'   => 'Cornerstone layout data — edit in the builder',
+	);
+}
+
+/** Compact description of a post — what a caller needs to verify a write. */
+function bsb_posts_describe( $post_id ) {
+	$post = get_post( $post_id );
+	if ( ! $post ) {
+		return null;
+	}
+	return array(
+		'id'         => (int) $post->ID,
+		'post_type'  => $post->post_type,
+		'status'     => $post->post_status,
+		'title'      => $post->post_title,
+		'slug'       => $post->post_name,
+		'author'     => (int) $post->post_author,
+		'permalink'  => get_permalink( $post ),
+		'content_chars' => strlen( (string) $post->post_content ),
+		'modified'   => $post->post_modified_gmt,
+	);
+}
+
+/**
+ * Per-field shape of the post's ACF values, read back from the database.
+ * Deliberately a summary, not the values: it is the cheap diff that tells you
+ * a repeater actually landed nine rows with the right sub-keys, without
+ * echoing 50KB of body copy back at the caller. Pass full=true for values.
+ */
+function bsb_posts_acf_summary( $post_id ) {
+	if ( ! function_exists( 'get_fields' ) ) {
+		return null;
+	}
+	$fields = get_fields( $post_id );
+	if ( ! $fields ) {
+		return array();
+	}
+	$out = array();
+	foreach ( $fields as $name => $value ) {
+		if ( is_array( $value ) ) {
+			$row = array( 'type' => 'array', 'count' => count( $value ) );
+			$first = reset( $value );
+			if ( is_array( $first ) ) {
+				$row['row_keys'] = array_keys( $first );
+				$empty = array();
+				foreach ( array_keys( $first ) as $k ) {
+					$blank = 0;
+					foreach ( $value as $r ) {
+						if ( ! isset( $r[ $k ] ) || $r[ $k ] === '' || $r[ $k ] === array() ) {
+							$blank++;
+						}
+					}
+					if ( $blank ) {
+						$empty[ $k ] = $blank;
+					}
+				}
+				if ( $empty ) {
+					$row['blank_by_key'] = $empty;
+				}
+			}
+			$out[ $name ] = $row;
+		} elseif ( is_string( $value ) ) {
+			$out[ $name ] = array( 'type' => 'string', 'chars' => strlen( $value ) );
+		} else {
+			$out[ $name ] = array( 'type' => gettype( $value ), 'value' => $value );
+		}
+	}
+	return $out;
+}
+
+/** Default author: the lowest-ID administrator, so posts don't land ownerless. */
+function bsb_posts_default_author() {
+	$admins = get_users( array(
+		'role'    => 'administrator',
+		'orderby' => 'ID',
+		'order'   => 'ASC',
+		'number'  => 1,
+		'fields'  => 'ID',
+	) );
+	return $admins ? (int) $admins[0] : 0;
+}
+
+/** Write acf / meta / terms / featured image. Returns human notes. */
+function bsb_posts_apply_extras( $post_id, WP_REST_Request $req ) {
+	$notes = array();
+
+	$acf = $req->get_param( 'acf' );
+	if ( is_array( $acf ) && $acf ) {
+		if ( ! function_exists( 'update_field' ) ) {
+			$notes[] = 'acf IGNORED — ACF is not active on this site';
+		} else {
+			foreach ( $acf as $name => $value ) {
+				update_field( (string) $name, $value, $post_id );
+			}
+			$notes[] = 'acf written: ' . implode( ', ', array_keys( $acf ) );
+		}
+	}
+
+	$meta = $req->get_param( 'meta' );
+	if ( is_array( $meta ) && $meta ) {
+		$blocked = bsb_meta_blocked();
+		foreach ( $meta as $key => $value ) {
+			if ( in_array( (string) $key, $blocked, true ) ) {
+				$notes[] = "meta $key refused (blocklisted)";
+				continue;
+			}
+			update_post_meta( $post_id, (string) $key, $value );
+		}
+		$notes[] = 'meta written: ' . implode( ', ', array_keys( $meta ) );
+	}
+
+	$terms = $req->get_param( 'terms' );
+	if ( is_array( $terms ) && $terms ) {
+		foreach ( $terms as $tax => $vals ) {
+			if ( ! taxonomy_exists( (string) $tax ) ) {
+				$notes[] = "taxonomy $tax does not exist — skipped";
+				continue;
+			}
+			$vals = is_array( $vals ) ? $vals : array( $vals );
+			$list = array();
+			foreach ( $vals as $v ) {
+				$list[] = is_numeric( $v ) ? (int) $v : (string) $v;
+			}
+			$res = wp_set_object_terms( $post_id, $list, (string) $tax );
+			$notes[] = is_wp_error( $res ) ? "terms on $tax failed: " . $res->get_error_message() : "terms set on $tax";
+		}
+	}
+
+	$thumb = $req->get_param( 'featured_image' );
+	if ( $thumb ) {
+		set_post_thumbnail( $post_id, (int) $thumb );
+		$notes[] = 'featured image set to ' . (int) $thumb;
+	}
+
+	return $notes;
+}
+
+/** Shared post-args builder. $existing = null on create. */
+function bsb_posts_args( WP_REST_Request $req, $existing = null ) {
+	$args = array();
+	$map  = array(
+		'title'   => 'post_title',
+		'content' => 'post_content',
+		'excerpt' => 'post_excerpt',
+		'status'  => 'post_status',
+	);
+	foreach ( $map as $param => $field ) {
+		$v = $req->get_param( $param );
+		if ( $v !== null ) {
+			$args[ $field ] = (string) $v;
+		}
+	}
+	$slug = $req->get_param( 'slug' );
+	if ( $slug !== null && (string) $slug !== '' ) {
+		$args['post_name'] = sanitize_title( (string) $slug );
+	}
+	foreach ( array( 'parent' => 'post_parent', 'menu_order' => 'menu_order', 'author' => 'post_author' ) as $param => $field ) {
+		$v = $req->get_param( $param );
+		if ( $v !== null && $v !== '' ) {
+			$args[ $field ] = (int) $v;
+		}
+	}
+	$date = $req->get_param( 'date' );
+	if ( $date !== null && (string) $date !== '' ) {
+		$args['post_date'] = (string) $date;
+	}
+	return $args;
+}
+
+/**
+ * POST /posts {post_type, title, status?, slug?, content?, excerpt?, parent?,
+ *              menu_order?, author?, date?, acf?, meta?, terms?,
+ *              featured_image?, confirm, dry_run}
+ */
+function bsb_posts_create( WP_REST_Request $req ) {
+	$dry  = filter_var( $req->get_param( 'dry_run' ), FILTER_VALIDATE_BOOLEAN );
+	$type = (string) $req->get_param( 'post_type' );
+
+	if ( $type === '' ) {
+		return new WP_Error( 'bsb_bad_input', 'post_type is required', array( 'status' => 400 ) );
+	}
+	$blocked = bsb_posts_blocked();
+	if ( isset( $blocked[ $type ] ) ) {
+		return new WP_Error( 'bsb_type_blocked', sprintf( 'post_type "%s" is refused here: %s', $type, $blocked[ $type ] ), array( 'status' => 400 ) );
+	}
+	if ( ! post_type_exists( $type ) ) {
+		return new WP_Error( 'bsb_type_unknown', sprintf( 'post_type "%s" is not registered — check GET /site for the list', $type ), array( 'status' => 400 ) );
+	}
+
+	$title = (string) $req->get_param( 'title' );
+	$slug  = sanitize_title( (string) $req->get_param( 'slug' ) );
+	if ( $title === '' && $slug === '' ) {
+		return new WP_Error( 'bsb_bad_input', 'title or slug is required', array( 'status' => 400 ) );
+	}
+
+	$collision = null;
+	if ( $slug !== '' ) {
+		$hit = get_page_by_path( $slug, OBJECT, $type );
+		if ( $hit ) {
+			$collision = array(
+				'id'     => (int) $hit->ID,
+				'status' => $hit->post_status,
+				'note'   => 'a post of this type already holds that slug — WordPress will suffix the new one. PUT /posts/' . $slug . ' to update it instead.',
+			);
+		}
+	}
+
+	$acf   = is_array( $req->get_param( 'acf' ) ) ? (array) $req->get_param( 'acf' ) : array();
+	$metas = is_array( $req->get_param( 'meta' ) ) ? (array) $req->get_param( 'meta' ) : array();
+	$terms = is_array( $req->get_param( 'terms' ) ) ? (array) $req->get_param( 'terms' ) : array();
+
+	$acf_plan = array();
+	foreach ( $acf as $name => $value ) {
+		$acf_plan[ $name ] = is_array( $value )
+			? array( 'rows' => count( $value ) )
+			: array( 'chars' => strlen( (string) $value ) );
+	}
+
+	$plan = array(
+		'post_type'      => $type,
+		'title'          => $title,
+		'status'         => (string) ( $req->get_param( 'status' ) ? $req->get_param( 'status' ) : 'draft' ),
+		'slug'           => $slug !== '' ? $slug : '(derived from title)',
+		'content_chars'  => strlen( (string) $req->get_param( 'content' ) ),
+		'acf'            => $acf_plan,
+		'meta_keys'      => array_keys( $metas ),
+		'terms'          => array_keys( $terms ),
+		'slug_collision' => $collision,
+		'acf_active'     => function_exists( 'update_field' ),
+	);
+
+	if ( $dry || ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array(
+			'dry_run' => true,
+			'note'    => $dry ? 'dry_run=true — nothing written' : 'confirm=true was not passed — nothing written',
+			'plan'    => $plan,
+		) );
+	}
+
+	$args = bsb_posts_args( $req );
+	$args['post_type'] = $type;
+	if ( ! isset( $args['post_status'] ) || $args['post_status'] === '' ) {
+		$args['post_status'] = 'draft';
+	}
+	if ( ! isset( $args['post_author'] ) ) {
+		$args['post_author'] = bsb_posts_default_author();
+	}
+
+	$id = wp_insert_post( $args, true );
+	if ( is_wp_error( $id ) ) {
+		return $id;
+	}
+
+	$notes = bsb_posts_apply_extras( (int) $id, $req );
+
+	return rest_ensure_response( array(
+		'created' => true,
+		'post'    => bsb_posts_describe( (int) $id ),
+		'acf'     => bsb_posts_acf_summary( (int) $id ),
+		'notes'   => $notes,
+	) );
+}
+
+/** GET /posts/{ref}?full= — read a post back, with its ACF shape or values. */
+function bsb_posts_get( WP_REST_Request $req ) {
+	$res = bsb_resolve( (string) $req->get_param( 'ref' ) );
+	if ( is_wp_error( $res ) ) {
+		return $res;
+	}
+	list( $id ) = $res;
+
+	$out = array( 'post' => bsb_posts_describe( $id ) );
+	if ( filter_var( $req->get_param( 'full' ), FILTER_VALIDATE_BOOLEAN ) && function_exists( 'get_fields' ) ) {
+		$out['acf_values'] = get_fields( $id );
+	} else {
+		$out['acf'] = bsb_posts_acf_summary( $id );
+	}
+	return rest_ensure_response( $out );
+}
+
+/**
+ * PUT /posts/{ref} — partial update. Only the fields you send change.
+ * ACF repeaters are replaced wholesale, which is how ACF works: send the
+ * complete array of rows, not a patch of one.
+ */
+function bsb_posts_update( WP_REST_Request $req ) {
+	$dry = filter_var( $req->get_param( 'dry_run' ), FILTER_VALIDATE_BOOLEAN );
+
+	$res = bsb_resolve( (string) $req->get_param( 'ref' ) );
+	if ( is_wp_error( $res ) ) {
+		return $res;
+	}
+	list( $id, $provisional ) = $res;
+	if ( $provisional ) {
+		return new WP_Error( 'bsb_provisional', 'That is a provisional occurrence id — use the events module', array( 'status' => 400 ) );
+	}
+
+	$type    = get_post_type( $id );
+	$blocked = bsb_posts_blocked();
+	if ( isset( $blocked[ $type ] ) ) {
+		return new WP_Error( 'bsb_type_blocked', sprintf( 'post %d is a "%s": %s', $id, $type, $blocked[ $type ] ), array( 'status' => 400 ) );
+	}
+
+	$args = bsb_posts_args( $req, $id );
+	$acf  = is_array( $req->get_param( 'acf' ) ) ? (array) $req->get_param( 'acf' ) : array();
+
+	$acf_plan = array();
+	foreach ( $acf as $name => $value ) {
+		$acf_plan[ $name ] = is_array( $value )
+			? array( 'rows' => count( $value ), 'note' => 'replaces the whole field' )
+			: array( 'chars' => strlen( (string) $value ) );
+	}
+
+	$plan = array(
+		'ref'          => $id,
+		'post_type'    => $type,
+		'before'       => bsb_posts_describe( $id ),
+		'post_fields'  => array_keys( $args ),
+		'acf'          => $acf_plan,
+		'acf_before'   => bsb_posts_acf_summary( $id ),
+	);
+
+	if ( $dry || ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array(
+			'dry_run' => true,
+			'note'    => $dry ? 'dry_run=true — nothing written' : 'confirm=true was not passed — nothing written',
+			'plan'    => $plan,
+		) );
+	}
+
+	if ( $args ) {
+		$args['ID'] = $id;
+		$upd = wp_update_post( $args, true );
+		if ( is_wp_error( $upd ) ) {
+			return $upd;
+		}
+	}
+
+	$notes = bsb_posts_apply_extras( $id, $req );
+
+	return rest_ensure_response( array(
+		'updated' => true,
+		'post'    => bsb_posts_describe( $id ),
+		'acf'     => bsb_posts_acf_summary( $id ),
+		'notes'   => $notes,
+	) );
 }
 
 /* ================================================================== *
