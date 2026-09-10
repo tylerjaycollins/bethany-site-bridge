@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.13.0
+ * Version:     0.13.1
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -104,6 +104,8 @@
  *    any URI ending in .php/.css itself — 403/404 — before WordPress runs)
  *   POST /files/restore             → {root, path, backup} put a backup back. confirm=true.
  *   POST /posts                     → create {post_type,title,status?,slug?,content?,acf?,meta?,terms?}. confirm=true.
+ *   (author accepts an ID, email or login; the default comes from the
+ *    BSB_DEFAULT_AUTHOR constant or the bsb_default_author option)
  *   GET  /posts/{ref}               → read one back; ?full=true returns ACF values, else their shape
  *   PUT  /posts/{ref}               → partial update; ACF repeaters replace wholesale. confirm=true.
  *
@@ -3438,8 +3440,51 @@ function bsb_posts_acf_summary( $post_id ) {
 	return $out;
 }
 
-/** Default author: the lowest-ID administrator, so posts don't land ownerless. */
+/**
+ * Resolve an author reference to a user ID. Accepts a numeric ID, an email
+ * address, a login, or a nicename, so callers and config never have to carry a
+ * site-specific integer around.
+ */
+function bsb_posts_resolve_author( $ref ) {
+	$ref = is_string( $ref ) ? trim( $ref ) : $ref;
+	if ( $ref === '' || $ref === null ) {
+		return 0;
+	}
+	if ( is_numeric( $ref ) ) {
+		return get_userdata( (int) $ref ) ? (int) $ref : 0;
+	}
+	$by = is_email( $ref ) ? 'email' : 'login';
+	$user = get_user_by( $by, $ref );
+	if ( ! $user ) {
+		$user = get_user_by( 'slug', $ref );
+	}
+	return $user ? (int) $user->ID : 0;
+}
+
+/**
+ * Default author for a created post, in precedence order:
+ *   1. BSB_DEFAULT_AUTHOR constant (ID, email or login)
+ *   2. bsb_default_author option (same forms) — set it over PUT /options
+ *   3. the lowest-ID administrator
+ *
+ * The fallback exists so a post never lands ownerless, but it is a poor
+ * default on a site whose user 1 is whoever installed WordPress years ago.
+ * Set the option and the guessing stops.
+ */
 function bsb_posts_default_author() {
+	if ( defined( 'BSB_DEFAULT_AUTHOR' ) && constant( 'BSB_DEFAULT_AUTHOR' ) !== '' ) {
+		$id = bsb_posts_resolve_author( constant( 'BSB_DEFAULT_AUTHOR' ) );
+		if ( $id ) {
+			return $id;
+		}
+	}
+	$opt = get_option( 'bsb_default_author', '' );
+	if ( $opt !== '' ) {
+		$id = bsb_posts_resolve_author( $opt );
+		if ( $id ) {
+			return $id;
+		}
+	}
 	$admins = get_users( array(
 		'role'    => 'administrator',
 		'orderby' => 'ID',
@@ -3524,10 +3569,17 @@ function bsb_posts_args( WP_REST_Request $req, $existing = null ) {
 	if ( $slug !== null && (string) $slug !== '' ) {
 		$args['post_name'] = sanitize_title( (string) $slug );
 	}
-	foreach ( array( 'parent' => 'post_parent', 'menu_order' => 'menu_order', 'author' => 'post_author' ) as $param => $field ) {
+	foreach ( array( 'parent' => 'post_parent', 'menu_order' => 'menu_order' ) as $param => $field ) {
 		$v = $req->get_param( $param );
 		if ( $v !== null && $v !== '' ) {
 			$args[ $field ] = (int) $v;
+		}
+	}
+	$author = $req->get_param( 'author' );
+	if ( $author !== null && $author !== '' ) {
+		$resolved = bsb_posts_resolve_author( $author );
+		if ( $resolved ) {
+			$args['post_author'] = $resolved;
 		}
 	}
 	$date = $req->get_param( 'date' );
