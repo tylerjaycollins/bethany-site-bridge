@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.14.0
+ * Version:     0.14.1
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -4296,18 +4296,66 @@ function bsb_bulletin_rows_summary( $rows ) {
 	return $out;
 }
 
+/** A stored ACF date in any of the shapes this site has (20261004, 2026-10-04, "2026-10-24 00:00:00") -> Ymd. */
+function bsb_bulletin_norm_date( $v ) {
+	$v = trim( (string) $v );
+	if ( $v === '' || preg_match( '/^\d{8}$/', $v ) ) {
+		return $v;
+	}
+	$t = strtotime( $v );
+	return $t ? gmdate( 'Ymd', $t ) : $v; // WordPress runs PHP in UTC, so this is the calendar day as stored
+}
+
+/** A stored ACF date-time ("2026-10-11 10:30 AM", "2026-10-11 10:30:00") -> Y-m-d H:i:s. */
+function bsb_bulletin_norm_datetime( $v ) {
+	$v = trim( (string) $v );
+	$t = $v !== '' ? strtotime( $v ) : false;
+	return $t ? gmdate( 'Y-m-d H:i:s', $t ) : $v;
+}
+
+/**
+ * One repeater's rows as STORED (raw meta, not ACF's display formatting), in the same shape
+ * bsb_bulletin_rows_summary() gives the plan, so the two compare field for field.
+ */
+function bsb_bulletin_stored_rows( $post_id, $name, $btn, $label_key, $link_key ) {
+	$n   = (int) get_post_meta( $post_id, $name, true );
+	$out = array();
+	for ( $i = 0; $i < $n; $i++ ) {
+		$p    = $name . '_' . $i . '_';
+		$m    = function ( $k ) use ( $post_id, $p ) {
+			return (string) get_post_meta( $post_id, $p . $k, true );
+		};
+		$mode = $m( 'title_and_date_date_options' );
+		$when = '';
+		if ( $mode === 'dtime' ) {
+			$when = bsb_bulletin_norm_datetime( $m( 'title_and_date_date_and_time' ) );
+		} elseif ( $mode === 'date' ) {
+			$when = bsb_bulletin_norm_date( $m( 'title_and_date_date_only' ) );
+		} elseif ( $mode === 'dtrng' ) {
+			$when = bsb_bulletin_norm_date( $m( 'title_and_date_date_range_date_range_one' ) ) . ' to ' . bsb_bulletin_norm_date( $m( 'title_and_date_date_range_date_range_two' ) );
+		} elseif ( $mode === 'cust' ) {
+			$when = $m( 'title_and_date_custom_date_description' );
+		}
+		$out[] = array(
+			'title'   => $m( 'title_and_date_announcement_and_event_title' ),
+			'date'    => trim( $mode . ' ' . $when ),
+			'button'  => trim( $m( $btn . '_' . $label_key ) . ' ' . $m( $btn . '_' . $link_key ) ),
+			'content' => mb_substr( wp_strip_all_tags( $m( 'content' ) ), 0, 90 ),
+		);
+	}
+	return $out;
+}
+
 /** What the post holds now, in the same shape as the plan. */
 function bsb_bulletin_current( $post_id ) {
-	if ( ! function_exists( 'get_field' ) ) {
-		return null;
-	}
 	$types = array();
-	foreach ( (array) get_field( 'order_of_service', $post_id ) as $r ) {
-		$types[] = (string) ( $r['service_item_type'] ?? '' );
+	$n     = (int) get_post_meta( $post_id, 'order_of_service', true );
+	for ( $i = 0; $i < $n; $i++ ) {
+		$types[] = (string) get_post_meta( $post_id, 'order_of_service_' . $i . '_service_item_type', true );
 	}
 	return array(
-		'highlights' => bsb_bulletin_rows_summary( get_field( 'highlight_loop', $post_id ) ),
-		'events'     => bsb_bulletin_rows_summary( get_field( 'announcements_and_events', $post_id ) ),
+		'highlights'       => bsb_bulletin_stored_rows( $post_id, 'highlight_loop', 'highlights_button_label_and_link', 'highlights_button_label', 'highlights_button_link' ),
+		'events'           => bsb_bulletin_stored_rows( $post_id, 'announcements_and_events', 'aande_button_label_and_link', 'aande_button_label', 'aande_button-link' ),
 		'order_of_service' => $types,
 	);
 }
