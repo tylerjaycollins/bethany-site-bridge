@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.14.1
+ * Version:     0.14.2
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -4070,6 +4070,10 @@ function bsb_bulletin_highlight_row( $item, $sunday_iso, $service_times, &$warni
 }
 
 function bsb_bulletin_event_row( $item, $sunday_iso, $service_times, &$warnings ) {
+	// A link with no label would draw a button with no words: default it like Highlights do.
+	$url   = trim( (string) ( $item['ctaUrl'] ?? '' ) );
+	$label = trim( (string) ( $item['ctaLabel'] ?? '' ) );
+	$item['ctaLabel'] = ( $label === '' && $url !== '' ) ? 'Learn More' : $label;
 	return array(
 		'title_and_date'              => bsb_bulletin_title_and_date( $item, $warnings ),
 		'content'                     => bsb_bulletin_content( $item, $sunday_iso, $service_times ),
