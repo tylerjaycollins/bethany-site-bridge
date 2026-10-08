@@ -25,6 +25,10 @@ Living backlog for the Bethany Site Bridge plugin. Ships by tag push (CI builds 
 
 ## Done (recent)
 
+- 0.14.0 — bulletin module (`POST /bulletin`, `GET /bulletin/{sunday}`, `PUT /bulletin/pco-credentials`)
+  for Rock RMS's bulletin build (rock-upgrades NEXT_STEPS "Bulletin in Rock"). Atlas still pushes the live
+  bulletin until the cutover; Rock calls this in dry-run until then.
+
 - 0.13.0 — posts module: create/read/update any post type, ACF via update_field()
   so repeaters land with their name/_name pairs intact. Built because pushing the
   "Along the Way" journal issue had no route that didn't need a WP application password.

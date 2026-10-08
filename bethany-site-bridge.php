@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.13.1
+ * Version:     0.14.0
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -43,6 +43,9 @@
  *             through update_field() so repeaters and their name/_name key
  *             pairs land correctly (v0.13.0). Core REST does this only for a
  *             logged-in user; a shared secret is not one.
+ *   bulletin — builds a Sunday's `bulletin` post from plain item data sent by
+ *             Rock RMS (v0.14.0): Atlas's ACF mapping ported to PHP, order of
+ *             service from Planning Center, scheduled for Friday 9:30.
  *   tweaks  — the site's custom PHP, absorbed from the Code Snippets plugin (v0.9.0)
  *             so it ships through this plugin's one-click update instead of being
  *             hand-edited in wp-admin: trip-update nested URLs (snippet #5), trip
@@ -230,6 +233,16 @@ add_action( 'rest_api_init', function () {
 	register_rest_route( 'atlas/v1', '/posts/(?P<ref>[^/]+)', array(
 		array( 'methods' => 'GET', 'callback' => 'bsb_posts_get',    'permission_callback' => $auth ),
 		array( 'methods' => 'PUT', 'callback' => 'bsb_posts_update', 'permission_callback' => $auth ),
+	) );
+	// --- bulletin ---
+	register_rest_route( 'atlas/v1', '/bulletin', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_bulletin_push', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/bulletin/pco-credentials', array(
+		array( 'methods' => 'PUT', 'callback' => 'bsb_bulletin_put_pco', 'permission_callback' => $auth ),
+	) );
+	register_rest_route( 'atlas/v1', '/bulletin/(?P<sunday>\\d{4}-\\d{2}-\\d{2})', array(
+		array( 'methods' => 'GET', 'callback' => 'bsb_bulletin_get', 'permission_callback' => $auth ),
 	) );
 } );
 
@@ -3765,6 +3778,752 @@ function bsb_posts_update( WP_REST_Request $req ) {
 		'post'    => bsb_posts_describe( $id ),
 		'acf'     => bsb_posts_acf_summary( $id ),
 		'notes'   => $notes,
+	) );
+}
+
+/* ================================================================== *
+ * MODULE: bulletin — build a Sunday's bulletin post from plain data
+ * ================================================================== *
+ *
+ * Rock RMS is replacing Atlas as the place the weekly bulletin is planned
+ * (2026-10-07). Rock knows the items; it should not have to know ACF. So Rock
+ * sends the Sunday's items as plain data and this module turns them into the
+ * `bulletin` post, porting Atlas's lib/wp-bulletin.ts rules exactly:
+ *
+ *   - title "Bulletin for October 11th, 2026", slug derived from it (WP's own
+ *     auto-slug for that title), found again by slug on every push
+ *   - scheduled for the Friday before at 9:30 am (site time); an old Sunday
+ *     falls back to a draft rather than auto-publishing in the past
+ *   - an existing post is updated in place; a published post stays published
+ *     (content only — this never un-publishes a live post)
+ *   - Highlights -> highlight_loop, Events & Announcements ->
+ *     announcements_and_events, with the date group's mode inferred the way
+ *     Atlas does (note > range > date+time > date > none)
+ *   - merge tags ({{cta}}, {{weeks_until}}, ...) resolved for the website, and
+ *     the email-only inline styles on membership-name lists stripped
+ *   - order of service read from Planning Center here (keys via the
+ *     BSB_PCO_APP_ID / BSB_PCO_SECRET constants or PUT /bulletin/pco-credentials),
+ *     with the sermon row linked to that Sunday's `sermons` post
+ *
+ * Differences from Atlas, on purpose:
+ *   - Dates are stored in ACF's own formats (date: Ymd, date-time: Y-m-d H:i:s).
+ *     Atlas went through REST and left a mix (20261004, 2026-10-04,
+ *     "2026-10-11 10:30 AM"); the theme reads all of them, this is just tidy.
+ *   - Event times arrive as people type them ("9am", "6:30pm"). One that can't be
+ *     read as a time falls back to the date written out in words, the same
+ *     fallback Atlas used when WP rejected a date.
+ *   - Fields Rock doesn't have yet (discussion questions, sermon-notes points)
+ *     are left untouched unless sent, so a push never wipes them.
+ *
+ * Writes are confirm=true gated; dry_run (or no confirm) returns the full plan,
+ * including what the post holds now, so a Rock push can be compared with the
+ * post Atlas made before anything is switched over.
+ */
+
+/** ACF field keys for the bulletin post's top-level fields (from a live post's _name meta). */
+function bsb_bulletin_keys() {
+	return array(
+		'bulletin_date_of_sunday'  => 'field_6345dc24c6380',
+		'highlight_loop'           => 'field_6345e058102d0',
+		'announcements_and_events' => 'field_635051c561d91',
+		'order_of_service'         => 'field_6348195b08b0d',
+		'comm-group-questions'     => 'field_6345dc160788d',
+		'fillable_notes_link'      => 'field_64db98b3dde56',
+	);
+}
+
+/** Planning Center: the Sunday service type (Atlas lib/planningcenter.ts). */
+if ( ! defined( 'BSB_PCO_SUNDAY_SERVICE_TYPE' ) ) {
+	define( 'BSB_PCO_SUNDAY_SERVICE_TYPE', '558041' );
+}
+
+function bsb_bulletin_is_iso( $s ) {
+	return is_string( $s ) && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $s ) && checkdate( (int) substr( $s, 5, 2 ), (int) substr( $s, 8, 2 ), (int) substr( $s, 0, 4 ) );
+}
+
+/** Midnight UTC timestamp for an ISO date — every date here is a calendar day, never a moment. */
+function bsb_bulletin_ts( $iso ) {
+	return gmmktime( 0, 0, 0, (int) substr( $iso, 5, 2 ), (int) substr( $iso, 8, 2 ), (int) substr( $iso, 0, 4 ) );
+}
+
+/** "Bulletin for October 11th, 2026" */
+function bsb_bulletin_title( $iso ) {
+	$ts  = bsb_bulletin_ts( $iso );
+	$day = (int) gmdate( 'j', $ts );
+	$suf = ( $day % 10 === 1 && $day !== 11 ) ? 'st' : ( ( $day % 10 === 2 && $day !== 12 ) ? 'nd' : ( ( $day % 10 === 3 && $day !== 13 ) ? 'rd' : 'th' ) );
+	return 'Bulletin for ' . gmdate( 'F', $ts ) . ' ' . $day . $suf . ', ' . gmdate( 'Y', $ts );
+}
+
+/** Mirrors WordPress's auto-slug for the title above. */
+function bsb_bulletin_slug( $iso ) {
+	$s = strtolower( bsb_bulletin_title( $iso ) );
+	$s = preg_replace( '/[^a-z0-9\s-]/', '', $s );
+	return preg_replace( '/\s+/', '-', $s );
+}
+
+/** Friday before at 9:30 (site time) and whether that Friday is already past. */
+function bsb_bulletin_publish( $iso, $today_iso ) {
+	$friday = gmdate( 'Y-m-d', bsb_bulletin_ts( $iso ) - 2 * DAY_IN_SECONDS );
+	return array( 'date' => $friday . ' 09:30:00', 'is_past' => $friday < $today_iso );
+}
+
+/**
+ * A typed time -> 'H:i:s', or null when it isn't one.
+ * Reads 9am, 9 am, 9:30pm, 9:30 p.m., 10:30 AM, 18:30, 18:30:00, noon, midnight.
+ */
+function bsb_bulletin_parse_time( $t ) {
+	$t = strtolower( trim( (string) $t ) );
+	if ( $t === '' ) {
+		return null;
+	}
+	if ( $t === 'noon' ) {
+		return '12:00:00';
+	}
+	if ( $t === 'midnight' ) {
+		return '00:00:00';
+	}
+	if ( preg_match( '/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?$/', $t, $m ) ) {
+		$h   = (int) $m[1];
+		$min = isset( $m[2] ) && $m[2] !== '' ? (int) $m[2] : 0;
+		if ( $h < 1 || $h > 12 || $min > 59 ) {
+			return null;
+		}
+		if ( $m[3] === 'p' && $h !== 12 ) {
+			$h += 12;
+		}
+		if ( $m[3] === 'a' && $h === 12 ) {
+			$h = 0;
+		}
+		return sprintf( '%02d:%02d:00', $h, $min );
+	}
+	if ( preg_match( '/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/', $t, $m ) ) {
+		$h = (int) $m[1];
+		if ( $h > 23 || (int) $m[2] > 59 ) {
+			return null;
+		}
+		return sprintf( '%02d:%02d:%02d', $h, (int) $m[2], isset( $m[3] ) ? (int) $m[3] : 0 );
+	}
+	return null;
+}
+
+/** Atlas formatEventDate(): how an item's date reads in words. */
+function bsb_bulletin_date_words( $item ) {
+	$note = trim( (string) ( $item['eventDateNote'] ?? '' ) );
+	if ( $note !== '' ) {
+		return $note;
+	}
+	$start = $item['eventStartDate'] ?? null;
+	if ( ! bsb_bulletin_is_iso( $start ) ) {
+		return null;
+	}
+	$s    = bsb_bulletin_ts( $start );
+	$time = trim( (string) ( $item['eventTime'] ?? '' ) );
+	$end  = $item['eventEndDate'] ?? null;
+	if ( bsb_bulletin_is_iso( $end ) ) {
+		$e = bsb_bulletin_ts( $end );
+		if ( gmdate( 'Y-m-d', $s ) === gmdate( 'Y-m-d', $e ) ) {
+			$base = gmdate( 'l, F j', $s );
+		} elseif ( gmdate( 'Y-m', $s ) === gmdate( 'Y-m', $e ) ) {
+			$base = gmdate( 'F j', $s ) . '-' . gmdate( 'j', $e );
+		} elseif ( gmdate( 'Y', $s ) === gmdate( 'Y', $e ) ) {
+			$base = gmdate( 'F j', $s ) . ' - ' . gmdate( 'F j', $e );
+		} else {
+			$base = gmdate( 'F j, Y', $s ) . ' - ' . gmdate( 'F j, Y', $e );
+		}
+		return $time !== '' ? $base . ' | ' . $time : $base;
+	}
+	return $time !== '' ? gmdate( 'l, F j', $s ) . ' at ' . $time : gmdate( 'l, F j', $s );
+}
+
+/** The title_and_date group for one item (Atlas titleAndDate + inferAcfMode). */
+function bsb_bulletin_title_and_date( $item, &$warnings ) {
+	$title = (string) ( $item['title'] ?? '' );
+	$out   = array(
+		'announcement_and_event_title' => $title,
+		'date_options'                 => 'no',
+		'date_and_time'                => '',
+		'date_only'                    => '',
+		'date_range'                   => array(
+			'need_multiple_months_format'    => 'no',
+			'date_range_one'                 => '',
+			'date_range_two'                 => '',
+			'date_range_two_multiple_months' => '',
+		),
+		'custom_date_description'      => '',
+	);
+	$note  = trim( (string) ( $item['eventDateNote'] ?? '' ) );
+	$start = $item['eventStartDate'] ?? null;
+	$end   = $item['eventEndDate'] ?? null;
+	$time  = trim( (string) ( $item['eventTime'] ?? '' ) );
+	$ymd   = function ( $iso ) {
+		return str_replace( '-', '', $iso );
+	};
+
+	if ( $note !== '' ) {
+		$out['date_options']            = 'cust';
+		$out['custom_date_description'] = $note;
+		return $out;
+	}
+	if ( ! bsb_bulletin_is_iso( $start ) ) {
+		return $out;
+	}
+	if ( bsb_bulletin_is_iso( $end ) ) {
+		$multi                    = substr( $start, 0, 7 ) !== substr( $end, 0, 7 ) ? 'yes' : 'no';
+		$out['date_options']      = 'dtrng';
+		$out['date_range']        = array(
+			'need_multiple_months_format'    => $multi,
+			'date_range_one'                 => $ymd( $start ),
+			'date_range_two'                 => $ymd( $end ),
+			'date_range_two_multiple_months' => $multi === 'yes' ? $ymd( $end ) : '',
+		);
+		return $out;
+	}
+	if ( $time !== '' ) {
+		$hms = bsb_bulletin_parse_time( $time );
+		if ( $hms === null ) {
+			// Atlas's fallbackToCustomDate: keep the push landing, as words.
+			$warnings[]                     = sprintf( '"%s": time "%s" isn\'t a time the date field can hold, so the date is written out instead', $title, $time );
+			$out['date_options']            = 'cust';
+			$out['custom_date_description'] = (string) bsb_bulletin_date_words( $item );
+			return $out;
+		}
+		$out['date_options']  = 'dtime';
+		$out['date_and_time'] = $start . ' ' . $hms;
+		return $out;
+	}
+	$out['date_options'] = 'date';
+	$out['date_only']    = $ymd( $start );
+	return $out;
+}
+
+/** Atlas lib/merge-tags.ts, website channel. Unknown tags stay as typed so a typo shows. */
+function bsb_bulletin_merge_tags( $text, $item, $sunday_iso, $service_times ) {
+	if ( $text === null || $text === '' ) {
+		return '';
+	}
+	$spell = array( 'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve' );
+	return preg_replace_callback( '/\{\{\s*([a-z_]+)\s*\}\}/i', function ( $m ) use ( $item, $sunday_iso, $service_times, $spell ) {
+		$start = $item['eventStartDate'] ?? null;
+		$end   = $item['eventEndDate'] ?? null;
+		$cta   = trim( (string) ( $item['ctaUrl'] ?? '' ) );
+		switch ( strtolower( $m[1] ) ) {
+			case 'weeks_until':
+				if ( ! bsb_bulletin_is_iso( $start ) ) {
+					return '';
+				}
+				$days = (int) round( ( bsb_bulletin_ts( $start ) - bsb_bulletin_ts( $sunday_iso ) ) / DAY_IN_SECONDS );
+				if ( $days < 7 ) {
+					return 'this week';
+				}
+				if ( $days < 14 ) {
+					return 'next week';
+				}
+				$w = intdiv( $days, 7 );
+				return ( $w <= 12 ? $spell[ $w ] : (string) $w ) . ' weeks away';
+			case 'event_date':
+				if ( ! bsb_bulletin_is_iso( $start ) ) {
+					return '';
+				}
+				$s = bsb_bulletin_ts( $start );
+				if ( ! bsb_bulletin_is_iso( $end ) || $end === $start ) {
+					return gmdate( 'F j', $s );
+				}
+				$e = bsb_bulletin_ts( $end );
+				return gmdate( 'Y-m', $s ) === gmdate( 'Y-m', $e )
+					? gmdate( 'F j', $s ) . '–' . gmdate( 'j', $e )
+					: gmdate( 'F j', $s ) . ' – ' . gmdate( 'F j', $e );
+			case 'event_day':
+				return bsb_bulletin_is_iso( $start ) ? gmdate( 'l', bsb_bulletin_ts( $start ) ) : '';
+			case 'service_times':
+				return (string) $service_times;
+			case 'compassion_link':
+				return 'https://bethanycentral.org/compassion';
+			case 'cta':
+				if ( $cta === '' ) {
+					return '';
+				}
+				return 'going to ' . rtrim( preg_replace( '#^https?://#i', '', $cta ), '/' );
+		}
+		return $m[0];
+	}, (string) $text );
+}
+
+/** Website content for an item: merge tags resolved, membership-name lists left to the theme's CSS. */
+function bsb_bulletin_content( $item, $sunday_iso, $service_times ) {
+	$html = bsb_bulletin_merge_tags( $item['content'] ?? '', $item, $sunday_iso, $service_times );
+	return preg_replace_callback( '#<ul class="membership-names"[^>]*>([\s\S]*?)</ul>#', function ( $m ) {
+		return '<ul class="membership-names">' . preg_replace( '/<li[^>]*>/', '<li>', $m[1] ) . '</ul>';
+	}, $html );
+}
+
+function bsb_bulletin_highlight_row( $item, $sunday_iso, $service_times, &$warnings ) {
+	$label = trim( (string) ( $item['ctaLabel'] ?? '' ) );
+	return array(
+		'title_and_date'                   => bsb_bulletin_title_and_date( $item, $warnings ),
+		'content'                          => bsb_bulletin_content( $item, $sunday_iso, $service_times ),
+		'highlights_button_label_and_link' => array(
+			'highlights_button_label'    => $label !== '' ? $label : 'Learn More',
+			'highlights_button_link'     => (string) ( $item['ctaUrl'] ?? '' ),
+			'highlights_qr_code_image'   => '',
+		),
+	);
+}
+
+function bsb_bulletin_event_row( $item, $sunday_iso, $service_times, &$warnings ) {
+	return array(
+		'title_and_date'              => bsb_bulletin_title_and_date( $item, $warnings ),
+		'content'                     => bsb_bulletin_content( $item, $sunday_iso, $service_times ),
+		'aande_button_label_and_link' => array(
+			'aande_button_label'   => (string) ( $item['ctaLabel'] ?? '' ),
+			'aande_button-link'    => (string) ( $item['ctaUrl'] ?? '' ),
+			'aande_qr_code_image'  => '',
+		),
+	);
+}
+
+/* ---------- Planning Center: order of service ---------- */
+
+function bsb_bulletin_pco_credentials() {
+	if ( defined( 'BSB_PCO_APP_ID' ) && defined( 'BSB_PCO_SECRET' ) && BSB_PCO_APP_ID !== '' && BSB_PCO_SECRET !== '' ) {
+		return array( (string) BSB_PCO_APP_ID, (string) BSB_PCO_SECRET, 'constant' );
+	}
+	$raw = bsb_option_read( 'bsb_pco_credentials' );
+	$c   = $raw !== '' ? json_decode( $raw, true ) : null;
+	if ( is_array( $c ) && ! empty( $c['app_id'] ) && ! empty( $c['secret'] ) ) {
+		return array( (string) $c['app_id'], (string) $c['secret'], 'option' );
+	}
+	return null;
+}
+
+function bsb_bulletin_pco_get( $path, $cred ) {
+	$res = wp_remote_get( 'https://api.planningcenteronline.com/services/v2' . $path, array(
+		'timeout' => 20,
+		'headers' => array( 'Authorization' => 'Basic ' . base64_encode( $cred[0] . ':' . $cred[1] ) ),
+	) );
+	if ( is_wp_error( $res ) ) {
+		return $res;
+	}
+	$code = (int) wp_remote_retrieve_response_code( $res );
+	if ( $code !== 200 ) {
+		return new WP_Error( 'bsb_pco_http', 'Planning Center answered HTTP ' . $code . ' for ' . $path );
+	}
+	$body = json_decode( wp_remote_retrieve_body( $res ), true );
+	return is_array( $body ) ? $body : new WP_Error( 'bsb_pco_json', 'Planning Center sent something that is not JSON' );
+}
+
+/** That Sunday's plan items, sorted, or WP_Error / null when there is no plan. */
+function bsb_bulletin_pco_items( $sunday_iso ) {
+	$cred = bsb_bulletin_pco_credentials();
+	if ( ! $cred ) {
+		return new WP_Error( 'bsb_pco_no_keys', 'No Planning Center keys — define BSB_PCO_APP_ID / BSB_PCO_SECRET or PUT /bulletin/pco-credentials' );
+	}
+	$base  = '/service_types/' . BSB_PCO_SUNDAY_SERVICE_TYPE . '/plans';
+	$match = null;
+	// Upcoming plans first (the usual case), then recent ones for a Sunday already past.
+	foreach ( array( '?filter=future&per_page=25', '?order=-sort_date&per_page=25' ) as $q ) {
+		$list = bsb_bulletin_pco_get( $base . $q, $cred );
+		if ( is_wp_error( $list ) ) {
+			return $list;
+		}
+		foreach ( (array) ( $list['data'] ?? array() ) as $p ) {
+			if ( strpos( (string) ( $p['attributes']['sort_date'] ?? '' ), $sunday_iso ) === 0 ) {
+				$match = $p;
+				break 2;
+			}
+		}
+	}
+	if ( ! $match ) {
+		return null;
+	}
+	$items = bsb_bulletin_pco_get( $base . '/' . rawurlencode( (string) $match['id'] ) . '/items?per_page=100', $cred );
+	if ( is_wp_error( $items ) ) {
+		return $items;
+	}
+	$out = array();
+	foreach ( (array) ( $items['data'] ?? array() ) as $it ) {
+		$a     = $it['attributes'] ?? array();
+		$type  = (string) ( $a['item_type'] ?? 'item' );
+		$out[] = array(
+			'sequence' => (int) ( $a['sequence'] ?? 0 ),
+			'itemType' => in_array( $type, array( 'header', 'item', 'song', 'media' ), true ) ? $type : 'item',
+			'title'    => (string) ( $a['title'] ?? '' ),
+		);
+	}
+	usort( $out, function ( $x, $y ) {
+		return $x['sequence'] - $y['sequence'];
+	} );
+	return array( 'plan_id' => (string) $match['id'], 'items' => $out );
+}
+
+/** Atlas classifyServiceItem(): [type, field-to-fill or null, value]. */
+function bsb_bulletin_classify( $it ) {
+	$t     = trim( $it['title'] );
+	$lower = strtolower( $t );
+	if ( $it['itemType'] === 'song' ) {
+		return $it['sequence'] <= 3 ? array( 'pre', 'service_item_prelude_song', $t ) : array( 'song', 'service_item_song', $t );
+	}
+	if ( strpos( $lower, 'call to worship' ) !== false || strpos( $lower, 'welcome & call' ) === 0 ) {
+		return array( 'call', 'service_item_call_to_worship', $t );
+	}
+	if ( strpos( $lower, 'welcome' ) !== false && strpos( $lower, 'announcement' ) !== false ) {
+		return array( 'anc', null, '' );
+	}
+	if ( strpos( $lower, 'bethany family prayer' ) !== false ) {
+		return array( 'fml', null, '' );
+	}
+	if ( strpos( $lower, 'walk-up communion' ) !== false || strpos( $lower, 'walk up communion' ) !== false ) {
+		return array( 'wlk', null, '' );
+	}
+	if ( strpos( $lower, 'benediction' ) !== false && strpos( $lower, 'compassion' ) !== false ) {
+		return array( 'cmp', null, '' );
+	}
+	if ( $lower === 'benediction' ) {
+		return array( 'ben', null, '' );
+	}
+	if ( strpos( $lower, 'communion' ) !== false ) {
+		return array( 'com', null, '' );
+	}
+	if ( strpos( $lower, 'scripture reading' ) !== false ) {
+		return array( 'passage', 'service_item_scripture_reading', $t );
+	}
+	if ( $lower === 'sermon' ) {
+		return array( 'serm', null, '' );
+	}
+	return array( 'oth', 'other_service_item', $t );
+}
+
+/** Atlas planToAcfOrderOfService(). */
+function bsb_bulletin_order_of_service( $items, $sermon_post_id ) {
+	$skip = array( 'countdown', 'pre-service loop' );
+	$rows = array();
+	foreach ( $items as $it ) {
+		if ( $it['itemType'] === 'header' || in_array( strtolower( trim( $it['title'] ) ), $skip, true ) ) {
+			continue;
+		}
+		list( $type, $field, $value ) = bsb_bulletin_classify( $it );
+		$row = array(
+			'service_item_type'                              => $type,
+			'service_item_prelude_song'                      => '',
+			'service_item_call_to_worship'                   => 'Call to Worship',
+			'service_item_benediction'                       => 'Benediction',
+			'service_item_benediction_&_compassion_offering' => 'Benediction & Compassion Offering',
+			'service_item_song'                              => '',
+			'service_item_welcome_&_announcements'           => 'Welcome & Announcements',
+			'service_item_bethany_family_prayer'             => 'Bethany Family Prayer',
+			'service_item_communion'                         => 'Communion',
+			'service_item_walk-up_communion'                 => 'Walk-up Communion',
+			'service_item_scripture_reading'                 => '',
+			'service_item_sermon_link'                       => '',
+			'other_service_item'                             => '',
+		);
+		if ( $field && $value !== '' ) {
+			$row[ $field ] = $value;
+		}
+		if ( $type === 'serm' && $sermon_post_id ) {
+			$row['service_item_sermon_link'] = array( (int) $sermon_post_id );
+		}
+		$rows[] = $row;
+	}
+	return $rows;
+}
+
+/** That Sunday's `sermons` post: by ACF sermon_date (any status), else an exact title match. */
+function bsb_bulletin_sermon_post( $sunday_iso, $title ) {
+	$ids = get_posts( array(
+		'post_type'      => 'sermons',
+		'post_status'    => array( 'publish', 'future', 'draft', 'pending', 'private' ),
+		'posts_per_page' => 1,
+		'fields'         => 'ids',
+		'meta_key'       => 'sermon_date',
+		'meta_value'     => str_replace( '-', '', $sunday_iso ),
+	) );
+	if ( $ids ) {
+		return (int) $ids[0];
+	}
+	$title = trim( (string) $title );
+	if ( $title === '' ) {
+		return null;
+	}
+	$hits = get_posts( array(
+		'post_type'      => 'sermons',
+		'post_status'    => array( 'publish', 'future', 'draft', 'pending', 'private' ),
+		'posts_per_page' => 5,
+		's'              => $title,
+	) );
+	foreach ( $hits as $p ) {
+		if ( strtolower( trim( $p->post_title ) ) === strtolower( $title ) ) {
+			return (int) $p->ID;
+		}
+	}
+	return count( $hits ) === 1 ? (int) $hits[0]->ID : null;
+}
+
+/** The bulletin post for a Sunday: by slug, else by its Sunday date field. */
+function bsb_bulletin_find( $sunday_iso ) {
+	$hit = get_page_by_path( bsb_bulletin_slug( $sunday_iso ), OBJECT, 'bulletin' );
+	if ( $hit && $hit->post_status !== 'trash' ) {
+		return $hit;
+	}
+	$ids = get_posts( array(
+		'post_type'      => 'bulletin',
+		'post_status'    => array( 'publish', 'future', 'draft', 'pending', 'private' ),
+		'posts_per_page' => 1,
+		'fields'         => 'ids',
+		'meta_key'       => 'bulletin_date_of_sunday',
+		'meta_value'     => str_replace( '-', '', $sunday_iso ),
+	) );
+	return $ids ? get_post( (int) $ids[0] ) : null;
+}
+
+/** Short readable view of a row set, for plans and read-backs. */
+function bsb_bulletin_rows_summary( $rows ) {
+	$out = array();
+	foreach ( (array) $rows as $r ) {
+		$td    = $r['title_and_date'] ?? array();
+		$mode  = (string) ( $td['date_options'] ?? '' );
+		$when  = $mode === 'dtime' ? ( $td['date_and_time'] ?? '' )
+			: ( $mode === 'date' ? ( $td['date_only'] ?? '' )
+			: ( $mode === 'dtrng' ? ( ( $td['date_range']['date_range_one'] ?? '' ) . ' to ' . ( $td['date_range']['date_range_two'] ?? '' ) )
+			: ( $mode === 'cust' ? ( $td['custom_date_description'] ?? '' ) : '' ) ) );
+		$btn   = $r['highlights_button_label_and_link'] ?? ( $r['aande_button_label_and_link'] ?? array() );
+		$out[] = array(
+			'title'   => (string) ( $td['announcement_and_event_title'] ?? '' ),
+			'date'    => trim( $mode . ' ' . $when ),
+			'button'  => trim( (string) ( $btn['highlights_button_label'] ?? ( $btn['aande_button_label'] ?? '' ) ) . ' ' . (string) ( $btn['highlights_button_link'] ?? ( $btn['aande_button-link'] ?? '' ) ) ),
+			'content' => mb_substr( wp_strip_all_tags( (string) ( $r['content'] ?? '' ) ), 0, 90 ),
+		);
+	}
+	return $out;
+}
+
+/** What the post holds now, in the same shape as the plan. */
+function bsb_bulletin_current( $post_id ) {
+	if ( ! function_exists( 'get_field' ) ) {
+		return null;
+	}
+	$types = array();
+	foreach ( (array) get_field( 'order_of_service', $post_id ) as $r ) {
+		$types[] = (string) ( $r['service_item_type'] ?? '' );
+	}
+	return array(
+		'highlights' => bsb_bulletin_rows_summary( get_field( 'highlight_loop', $post_id ) ),
+		'events'     => bsb_bulletin_rows_summary( get_field( 'announcements_and_events', $post_id ) ),
+		'order_of_service' => $types,
+	);
+}
+
+/**
+ * POST /bulletin
+ * {sunday: yyyy-mm-dd, highlights: [item], events: [item], sermon_title?, service_times?,
+ *  fillable_notes_link?, order_of_service?: "pco" (default) | "skip", confirm, dry_run}
+ * item = {title, content, ctaUrl?, ctaLabel?, eventStartDate?, eventEndDate?, eventTime?, eventDateNote?}
+ */
+function bsb_bulletin_push( WP_REST_Request $req ) {
+	if ( ! post_type_exists( 'bulletin' ) ) {
+		return new WP_Error( 'bsb_no_bulletin_type', 'The bulletin post type is not registered on this site', array( 'status' => 501 ) );
+	}
+	if ( ! function_exists( 'update_field' ) ) {
+		return new WP_Error( 'bsb_no_acf', 'ACF is not active, so the bulletin fields cannot be written', array( 'status' => 501 ) );
+	}
+	$sunday = (string) $req->get_param( 'sunday' );
+	if ( ! bsb_bulletin_is_iso( $sunday ) || gmdate( 'w', bsb_bulletin_ts( $sunday ) ) !== '0' ) {
+		return new WP_Error( 'bsb_bad_input', 'sunday must be a yyyy-mm-dd date that falls on a Sunday', array( 'status' => 400 ) );
+	}
+	$dry     = filter_var( $req->get_param( 'dry_run' ), FILTER_VALIDATE_BOOLEAN ) || ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN );
+	$times   = (string) $req->get_param( 'service_times' );
+	$warn    = array();
+	$hl_in   = is_array( $req->get_param( 'highlights' ) ) ? array_values( (array) $req->get_param( 'highlights' ) ) : array();
+	$ev_in   = is_array( $req->get_param( 'events' ) ) ? array_values( (array) $req->get_param( 'events' ) ) : array();
+	$hl_rows = array();
+	$ev_rows = array();
+	foreach ( $hl_in as $it ) {
+		$hl_rows[] = bsb_bulletin_highlight_row( (array) $it, $sunday, $times, $warn );
+	}
+	foreach ( $ev_in as $it ) {
+		$ev_rows[] = bsb_bulletin_event_row( (array) $it, $sunday, $times, $warn );
+	}
+
+	$fields = array(
+		'bulletin_date_of_sunday'  => str_replace( '-', '', $sunday ),
+		'highlight_loop'           => $hl_rows,
+		'announcements_and_events' => $ev_rows,
+	);
+
+	// Order of service: left alone (with a warning) whenever Planning Center can't supply it,
+	// so a Planning Center hiccup never empties the website's order of service.
+	$sermon_id = null;
+	$oos_note  = 'skipped (order_of_service=skip)';
+	if ( (string) $req->get_param( 'order_of_service' ) !== 'skip' ) {
+		$plan = bsb_bulletin_pco_items( $sunday );
+		if ( is_wp_error( $plan ) ) {
+			$oos_note = 'left as is: ' . $plan->get_error_message();
+			$warn[]   = 'Order of service ' . $oos_note;
+		} elseif ( ! $plan ) {
+			$oos_note = 'left as is: no Planning Center plan for ' . $sunday;
+			$warn[]   = 'Order of service ' . $oos_note;
+		} else {
+			foreach ( $plan['items'] as $it ) {
+				if ( strtolower( trim( $it['title'] ) ) === 'sermon' ) {
+					$sermon_id = bsb_bulletin_sermon_post( $sunday, $req->get_param( 'sermon_title' ) );
+					if ( ! $sermon_id ) {
+						$warn[] = 'No sermons post found for ' . $sunday . ', so the sermon row has no link yet';
+					}
+					break;
+				}
+			}
+			$fields['order_of_service'] = bsb_bulletin_order_of_service( $plan['items'], $sermon_id );
+			$oos_note                   = count( $fields['order_of_service'] ) . ' rows from Planning Center plan ' . $plan['plan_id'];
+		}
+	}
+	$link = (string) $req->get_param( 'fillable_notes_link' );
+	if ( $link !== '' ) {
+		$fields['fillable_notes_link'] = $link;
+	}
+
+	$existing = bsb_bulletin_find( $sunday );
+	$pub      = bsb_bulletin_publish( $sunday, current_time( 'Y-m-d' ) );
+	$title    = bsb_bulletin_title( $sunday );
+	if ( $existing ) {
+		$action = 'update';
+		$status = $existing->post_status;
+		$date   = $existing->post_date;
+		if ( $existing->post_status !== 'publish' && ! $pub['is_past'] ) {
+			$status = 'future';
+			$date   = $pub['date'];
+		}
+	} else {
+		$action = 'create';
+		$status = $pub['is_past'] ? 'draft' : 'future';
+		$date   = $pub['is_past'] ? null : $pub['date'];
+	}
+
+	$plan_out = array(
+		'action'           => $action,
+		'post_id'          => $existing ? (int) $existing->ID : null,
+		'title'            => $title,
+		'slug'             => $existing ? $existing->post_name : bsb_bulletin_slug( $sunday ),
+		'status'           => $status,
+		'publish_date'     => $date,
+		'highlights'       => bsb_bulletin_rows_summary( $hl_rows ),
+		'events'           => bsb_bulletin_rows_summary( $ev_rows ),
+		'order_of_service' => isset( $fields['order_of_service'] ) ? wp_list_pluck( $fields['order_of_service'], 'service_item_type' ) : null,
+		'order_of_service_note' => $oos_note,
+		'sermon_post'      => $sermon_id,
+		'fields_written'   => array_keys( $fields ),
+	);
+
+	if ( $dry ) {
+		return rest_ensure_response( array(
+			'dry_run'  => true,
+			'note'     => 'nothing written — pass confirm=true to write',
+			'plan'     => $plan_out,
+			'current'  => $existing ? bsb_bulletin_current( (int) $existing->ID ) : null,
+			'warnings' => $warn,
+		) );
+	}
+
+	if ( $existing ) {
+		$id   = (int) $existing->ID;
+		$args = array( 'ID' => $id, 'post_title' => $title );
+		if ( $status !== $existing->post_status || $date !== $existing->post_date ) {
+			$args['post_status']   = $status;
+			$args['post_date']     = $date;
+			$args['post_date_gmt'] = get_gmt_from_date( $date );
+			$args['edit_date']     = true;
+		}
+		$res = wp_update_post( $args, true );
+		if ( is_wp_error( $res ) ) {
+			return $res;
+		}
+	} else {
+		$args = array(
+			'post_type'   => 'bulletin',
+			'post_title'  => $title,
+			'post_name'   => bsb_bulletin_slug( $sunday ),
+			'post_status' => $status,
+			'post_author' => bsb_posts_default_author(),
+		);
+		if ( $date ) {
+			$args['post_date']     = $date;
+			$args['post_date_gmt'] = get_gmt_from_date( $date );
+		}
+		$id = wp_insert_post( $args, true );
+		if ( is_wp_error( $id ) ) {
+			return $id;
+		}
+		$id = (int) $id;
+	}
+
+	// By field KEY: on a brand-new post there are no _name references yet, and a key
+	// is the one lookup ACF never has to guess at.
+	$keys = bsb_bulletin_keys();
+	foreach ( $fields as $name => $value ) {
+		update_field( $keys[ $name ], $value, $id );
+	}
+	update_post_meta( $id, '_bsb_bulletin_pushed', wp_json_encode( array(
+		'at'     => current_time( 'mysql' ),
+		'source' => (string) ( $req->get_param( 'source' ) ? $req->get_param( 'source' ) : 'bridge' ),
+	) ) );
+
+	$post = get_post( $id );
+	return rest_ensure_response( array(
+		'written'  => true,
+		'action'   => $action === 'create' ? 'created' : 'updated',
+		'post'     => array(
+			'id'           => $id,
+			'status'       => $post->post_status,
+			'publish_date' => $post->post_date,
+			'link'         => get_permalink( $id ),
+			'edit_link'    => admin_url( 'post.php?post=' . $id . '&action=edit' ),
+		),
+		'saved'    => bsb_bulletin_current( $id ), // read back off the post, not what we meant to write
+		'order_of_service_note' => $oos_note,
+		'warnings' => $warn,
+	) );
+}
+
+/** GET /bulletin/{sunday} — what that Sunday's post holds, or 404. */
+function bsb_bulletin_get( WP_REST_Request $req ) {
+	$sunday = (string) $req->get_param( 'sunday' );
+	if ( ! bsb_bulletin_is_iso( $sunday ) ) {
+		return new WP_Error( 'bsb_bad_input', 'sunday must be yyyy-mm-dd', array( 'status' => 400 ) );
+	}
+	$p = bsb_bulletin_find( $sunday );
+	if ( ! $p ) {
+		return new WP_Error( 'bsb_not_found', 'No bulletin post for ' . $sunday, array( 'status' => 404 ) );
+	}
+	$pushed = json_decode( (string) get_post_meta( $p->ID, '_bsb_bulletin_pushed', true ), true );
+	return rest_ensure_response( array(
+		'post'        => array( 'id' => (int) $p->ID, 'status' => $p->post_status, 'publish_date' => $p->post_date, 'link' => get_permalink( $p ) ),
+		'last_bridge_push' => $pushed ? $pushed : null,
+		'current'     => bsb_bulletin_current( (int) $p->ID ),
+	) );
+}
+
+/**
+ * PUT /bulletin/pco-credentials {app_id, secret, confirm} — store the Planning Center
+ * personal access token as an option (same reason as the GF poke token: no wp-config
+ * access on this host). The constants win when defined. Never echoed back.
+ */
+function bsb_bulletin_put_pco( WP_REST_Request $req ) {
+	$app = trim( (string) $req->get_param( 'app_id' ) );
+	$sec = trim( (string) $req->get_param( 'secret' ) );
+	if ( $app === '' || $sec === '' ) {
+		return new WP_Error( 'bsb_bad_input', 'app_id and secret are both required', array( 'status' => 400 ) );
+	}
+	$now = bsb_bulletin_pco_credentials();
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array( 'dry_run' => true, 'note' => 'confirm=true was not passed — nothing written', 'currently_set_via' => $now ? $now[2] : null ) );
+	}
+	if ( ! bsb_option_write( 'bsb_pco_credentials', wp_json_encode( array( 'app_id' => $app, 'secret' => $sec ) ) ) ) {
+		return new WP_Error( 'bsb_write_failed', 'The option row does not hold the value after writing — the keys are NOT set.', array( 'status' => 500 ) );
+	}
+	$check = bsb_bulletin_pco_get( '/service_types/' . BSB_PCO_SUNDAY_SERVICE_TYPE, bsb_bulletin_pco_credentials() );
+	return rest_ensure_response( array(
+		'updated'      => true,
+		'set_via'      => 'option',
+		'pco_check'    => is_wp_error( $check ) ? $check->get_error_message() : 'ok: Sunday service type readable',
+		'note'         => ( $now && $now[2] === 'constant' ) ? 'BSB_PCO_APP_ID / BSB_PCO_SECRET are defined and SHADOW this option.' : null,
 	) );
 }
 
