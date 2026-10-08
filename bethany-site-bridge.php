@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.16.1
+ * Version:     0.16.2
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -244,6 +244,9 @@ add_action( 'rest_api_init', function () {
 	) );
 	register_rest_route( 'atlas/v1', '/bulletin/(?P<sunday>\\d{4}-\\d{2}-\\d{2})/order', array(
 		array( 'methods' => 'GET', 'callback' => 'bsb_bulletin_order_get', 'permission_callback' => 'bsb_bulletin_auth' ),
+	) );
+	register_rest_route( 'atlas/v1', '/bulletin/(?P<sunday>\\d{4}-\\d{2}-\\d{2})/pdf', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_bulletin_pdf_put', 'permission_callback' => 'bsb_bulletin_auth' ),
 	) );
 	register_rest_route( 'atlas/v1', '/bulletin/pco-credentials', array(
 		array( 'methods' => 'PUT', 'callback' => 'bsb_bulletin_put_pco', 'permission_callback' => $auth ),
@@ -4662,6 +4665,71 @@ function bsb_bulletin_get( WP_REST_Request $req ) {
 		'post'        => array( 'id' => (int) $p->ID, 'status' => $p->post_status, 'publish_date' => $p->post_date, 'link' => get_permalink( $p ) ),
 		'last_bridge_push' => $pushed ? $pushed : null,
 		'current'     => bsb_bulletin_current( (int) $p->ID ),
+	) );
+}
+
+/**
+ * POST /bulletin/{sunday}/pdf {pdf_base64, filename, confirm} — the printed bulletin, saved as a PDF from Rock's print view, attached to that
+ * Sunday's bulletin post as the "print_bulletin_pdf" ACF field (what Atlas's pushPrintBulletinPdf did with its headless Chrome; Rock has no
+ * PDF renderer, so the person saves the PDF and Rock sends the bytes here). Bulletin key or master key. The bytes travel base64 in JSON
+ * (the host firewall 403s binary bodies on /wp-json, as the files module found). A new attachment each time; the field points at the newest.
+ */
+function bsb_bulletin_pdf_put( WP_REST_Request $req ) {
+	$sunday = (string) $req->get_param( 'sunday' );
+	if ( ! bsb_bulletin_is_iso( $sunday ) ) {
+		return new WP_Error( 'bsb_bad_input', 'sunday must be yyyy-mm-dd', array( 'status' => 400 ) );
+	}
+	$p = bsb_bulletin_find( $sunday );
+	if ( ! $p ) {
+		return new WP_Error( 'bsb_not_found', 'No bulletin post for ' . $sunday . ' — push the bulletin first', array( 'status' => 404 ) );
+	}
+	$b64 = (string) $req->get_param( 'pdf_base64' );
+	$raw = base64_decode( preg_replace( '/\s+/', '', $b64 ), true );
+	if ( $raw === false || strlen( $raw ) < 1000 ) {
+		return new WP_Error( 'bsb_bad_input', 'pdf_base64 is not a base64 PDF', array( 'status' => 400 ) );
+	}
+	if ( substr( $raw, 0, 5 ) !== '%PDF-' ) {
+		return new WP_Error( 'bsb_bad_input', 'That file is not a PDF', array( 'status' => 400 ) );
+	}
+	if ( strlen( $raw ) > 10 * 1024 * 1024 ) {
+		return new WP_Error( 'bsb_bad_input', 'PDF is over 10 MB', array( 'status' => 413 ) );
+	}
+	$name = sanitize_file_name( (string) $req->get_param( 'filename' ) );
+	if ( $name === '' || ! preg_match( '/\.pdf$/i', $name ) ) {
+		$name = $sunday . '-Bulletin.pdf';
+	}
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array( 'dry_run' => true, 'post_id' => (int) $p->ID, 'bytes' => strlen( $raw ), 'filename' => $name,
+			'current_pdf' => (int) get_post_meta( $p->ID, 'print_bulletin_pdf', true ) ) );
+	}
+	$up = wp_upload_bits( $name, null, $raw );
+	if ( ! empty( $up['error'] ) ) {
+		return new WP_Error( 'bsb_write_failed', 'Upload failed: ' . $up['error'], array( 'status' => 500 ) );
+	}
+	$att_id = wp_insert_attachment( array(
+		'post_mime_type' => 'application/pdf',
+		'post_title'     => bsb_bulletin_title( $sunday ) . ' (print)',
+		'post_content'   => '',
+		'post_status'    => 'inherit',
+	), $up['file'], (int) $p->ID, true );
+	if ( is_wp_error( $att_id ) ) {
+		return new WP_Error( 'bsb_write_failed', 'Attachment failed: ' . $att_id->get_error_message(), array( 'status' => 500 ) );
+	}
+	require_once ABSPATH . 'wp-admin/includes/image.php';
+	wp_update_attachment_metadata( $att_id, wp_generate_attachment_metadata( $att_id, $up['file'] ) );
+	if ( function_exists( 'update_field' ) ) {
+		update_field( 'print_bulletin_pdf', (int) $att_id, (int) $p->ID );
+	} else {
+		update_post_meta( $p->ID, 'print_bulletin_pdf', (int) $att_id );
+	}
+	$set = (int) get_post_meta( $p->ID, 'print_bulletin_pdf', true );
+	return rest_ensure_response( array(
+		'post_id'  => (int) $p->ID,
+		'media_id' => (int) $att_id,
+		'url'      => wp_get_attachment_url( $att_id ),
+		'bytes'    => strlen( $raw ),
+		'filename' => $name,
+		'field_set' => $set === (int) $att_id,
 	) );
 }
 
