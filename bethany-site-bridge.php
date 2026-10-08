@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.14.2
+ * Version:     0.15.0
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -235,14 +235,18 @@ add_action( 'rest_api_init', function () {
 		array( 'methods' => 'PUT', 'callback' => 'bsb_posts_update', 'permission_callback' => $auth ),
 	) );
 	// --- bulletin ---
+	// Rock calls these two with its own bulletin-only key (X-Bulletin-Key); the master key works too.
 	register_rest_route( 'atlas/v1', '/bulletin', array(
-		array( 'methods' => 'POST', 'callback' => 'bsb_bulletin_push', 'permission_callback' => $auth ),
+		array( 'methods' => 'POST', 'callback' => 'bsb_bulletin_push', 'permission_callback' => 'bsb_bulletin_auth' ),
+	) );
+	register_rest_route( 'atlas/v1', '/bulletin/(?P<sunday>\\d{4}-\\d{2}-\\d{2})', array(
+		array( 'methods' => 'GET', 'callback' => 'bsb_bulletin_get', 'permission_callback' => 'bsb_bulletin_auth' ),
 	) );
 	register_rest_route( 'atlas/v1', '/bulletin/pco-credentials', array(
 		array( 'methods' => 'PUT', 'callback' => 'bsb_bulletin_put_pco', 'permission_callback' => $auth ),
 	) );
-	register_rest_route( 'atlas/v1', '/bulletin/(?P<sunday>\\d{4}-\\d{2}-\\d{2})', array(
-		array( 'methods' => 'GET', 'callback' => 'bsb_bulletin_get', 'permission_callback' => $auth ),
+	register_rest_route( 'atlas/v1', '/bulletin/rock-key', array(
+		array( 'methods' => 'PUT', 'callback' => 'bsb_bulletin_put_rock_key', 'permission_callback' => $auth ),
 	) );
 } );
 
@@ -3819,6 +3823,39 @@ function bsb_posts_update( WP_REST_Request $req ) {
  * including what the post holds now, so a Rock push can be compared with the
  * post Atlas made before anything is switched over.
  */
+
+/**
+ * Auth for the bulletin push/read routes: the master key, OR the bulletin-only key Rock holds
+ * (header X-Bulletin-Key, option bsb_bulletin_key). Rock stores its key where anyone who edits
+ * Lava can read it, so it gets one that opens these two routes and nothing else (v0.15.0).
+ */
+function bsb_bulletin_auth( WP_REST_Request $req ) {
+	$main = bsb_auth( $req );
+	if ( $main === true ) {
+		return true;
+	}
+	$want = bsb_option_read( 'bsb_bulletin_key' );
+	$got  = (string) $req->get_header( 'x-bulletin-key' );
+	if ( $want !== '' && $got !== '' && hash_equals( $want, $got ) ) {
+		return true;
+	}
+	return $main;
+}
+
+/** PUT /bulletin/rock-key {key, confirm} — set the bulletin-only key (32+ characters). Master key required. Never echoed. */
+function bsb_bulletin_put_rock_key( WP_REST_Request $req ) {
+	$key = (string) $req->get_param( 'key' );
+	if ( strlen( $key ) < 32 ) {
+		return new WP_Error( 'bsb_bad_input', 'key must be at least 32 characters', array( 'status' => 400 ) );
+	}
+	if ( ! filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return rest_ensure_response( array( 'dry_run' => true, 'note' => 'confirm=true was not passed — nothing written', 'currently_set' => bsb_option_read( 'bsb_bulletin_key' ) !== '' ) );
+	}
+	if ( ! bsb_option_write( 'bsb_bulletin_key', $key ) ) {
+		return new WP_Error( 'bsb_write_failed', 'The option row does not hold the value after writing — the key is NOT set.', array( 'status' => 500 ) );
+	}
+	return rest_ensure_response( array( 'updated' => true, 'key_length' => strlen( $key ), 'opens' => array( 'POST /bulletin', 'GET /bulletin/{sunday}' ) ) );
+}
 
 /** ACF field keys for the bulletin post's top-level fields (from a live post's _name meta). */
 function bsb_bulletin_keys() {

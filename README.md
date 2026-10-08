@@ -18,7 +18,7 @@ reason to hide it; not intended as a general-purpose plugin.
 | `redirects` | Path → URL redirects managed over REST — legacy URLs after a page move, including the nested paths WordPress's own 404 guess can't rescue. Exact and `/*` prefix rules, per-rule hit/referer stats, and a nested-404 rescue (a multi-segment 404 whose last segment is exactly one published page/post's slug is 301'd there; off via option `bsb_redirects_settings` `{"rescue":false}`) |
 | `content` | Find text across post content, post meta (Cornerstone builder JSON included — JSON-escaped slashes are searched too) and options; serialized-safe replace with a dry run listing every row |
 | `files` | Read/write files under `wp-content/mu-plugins` and the active child theme — the SFTP replacement. Base64 transport (the host firewall rejects PHP in request bodies), PHP syntax lint before any write, redeclaration check, backups outside the auto-loaded dirs, sha1-checked overwrites, restore |
-| `bulletin` | Builds a Sunday's `bulletin` post from plain item data sent by Rock RMS (`POST /bulletin`, dry run by default): Atlas's ACF mapping in PHP, order of service from Planning Center, scheduled for Friday 9:30 |
+| `bulletin` | Builds a Sunday's `bulletin` post from plain item data sent by Rock RMS (`POST /bulletin`, dry run by default; Rock uses its own bulletin-only `X-Bulletin-Key`): Atlas's ACF mapping in PHP, order of service from Planning Center, scheduled for Friday 9:30 |
 | `updater` | One-click updates from this repo's releases |
 
 ### Why the events module exists
