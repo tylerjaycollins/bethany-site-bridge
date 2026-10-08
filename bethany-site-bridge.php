@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.16.0
+ * Version:     0.16.1
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -3946,6 +3946,32 @@ function bsb_bulletin_parse_time( $t ) {
 	return null;
 }
 
+/**
+ * The START of a typed time range as HH:MM:SS: "11:00am–1:00pm" -> 11:00:00, "6:30-8 PM" -> 18:30:00 (the start borrows the
+ * end's am/pm when it has none), "6:30–8:30 PM" -> 18:30:00. Null when nothing parses. For the Events & Announcements list,
+ * whose ACF group has no custom-date text field, so a range has to become a date-and-time (the start) to show at all.
+ */
+function bsb_bulletin_parse_start_time( $time ) {
+	$t = trim( (string) $time );
+	if ( $t === '' ) {
+		return null;
+	}
+	$hms = bsb_bulletin_parse_time( $t );
+	if ( $hms !== null ) {
+		return $hms;
+	}
+	$parts = preg_split( '/\s*(?:[-\x{2013}\x{2014}]|\bto\b)\s*/u', $t, 2 );
+	if ( ! is_array( $parts ) || count( $parts ) < 2 ) {
+		return null;
+	}
+	$start = trim( $parts[0] );
+	$end   = trim( $parts[1] );
+	if ( ! preg_match( '/[ap]\.?\s*m\.?$/i', $start ) && preg_match( '/([ap])\.?\s*m\.?$/i', $end, $m ) ) {
+		$start .= $m[1] . 'm';
+	}
+	return bsb_bulletin_parse_time( $start );
+}
+
 /** Atlas formatEventDate(): how an item's date reads in words. */
 function bsb_bulletin_date_words( $item ) {
 	$note = trim( (string) ( $item['eventDateNote'] ?? '' ) );
@@ -3975,8 +4001,13 @@ function bsb_bulletin_date_words( $item ) {
 	return $time !== '' ? gmdate( 'l, F j', $s ) . ' at ' . $time : gmdate( 'l, F j', $s );
 }
 
-/** The title_and_date group for one item (Atlas titleAndDate + inferAcfMode). */
-function bsb_bulletin_title_and_date( $item, &$warnings ) {
+/**
+ * The title_and_date group for one item (Atlas titleAndDate + inferAcfMode).
+ * $allow_custom: Highlights have a custom-date text field (custom_date_description); the Events & Announcements group does
+ * NOT, so for an event "cust" would show no date at all (found on the Oct 11 2026 post, the first one Rock made). Events
+ * fall back to a date-and-time (the start of a range) or the date alone, with a warning saying so.
+ */
+function bsb_bulletin_title_and_date( $item, &$warnings, $allow_custom = true ) {
 	$title = (string) ( $item['title'] ?? '' );
 	$out   = array(
 		'announcement_and_event_title' => $title,
@@ -3999,10 +4030,13 @@ function bsb_bulletin_title_and_date( $item, &$warnings ) {
 		return str_replace( '-', '', $iso );
 	};
 
-	if ( $note !== '' ) {
+	if ( $note !== '' && $allow_custom ) {
 		$out['date_options']            = 'cust';
 		$out['custom_date_description'] = $note;
 		return $out;
+	}
+	if ( $note !== '' ) {
+		$warnings[] = sprintf( '"%s": the Events & Announcements list can\'t show a written-out date ("%s"), so the item\'s date fields are used instead%s', $title, $note, bsb_bulletin_is_iso( $start ) ? '' : ' (it has none, so no date shows)' );
 	}
 	if ( ! bsb_bulletin_is_iso( $start ) ) {
 		return $out;
@@ -4020,12 +4054,22 @@ function bsb_bulletin_title_and_date( $item, &$warnings ) {
 	}
 	if ( $time !== '' ) {
 		$hms = bsb_bulletin_parse_time( $time );
-		if ( $hms === null ) {
+		if ( $hms === null && $allow_custom ) {
 			// Atlas's fallbackToCustomDate: keep the push landing, as words.
 			$warnings[]                     = sprintf( '"%s": time "%s" isn\'t a time the date field can hold, so the date is written out instead', $title, $time );
 			$out['date_options']            = 'cust';
 			$out['custom_date_description'] = (string) bsb_bulletin_date_words( $item );
 			return $out;
+		}
+		if ( $hms === null ) {
+			$hms = bsb_bulletin_parse_start_time( $time );
+			if ( $hms === null ) {
+				$warnings[]          = sprintf( '"%s": time "%s" couldn\'t be read, so only the date shows on the website', $title, $time );
+				$out['date_options'] = 'date';
+				$out['date_only']    = $ymd( $start );
+				return $out;
+			}
+			$warnings[] = sprintf( '"%s": the website shows the start of "%s" (its list can\'t show a time range)', $title, $time );
 		}
 		$out['date_options']  = 'dtime';
 		$out['date_and_time'] = $start . ' ' . $hms;
@@ -4115,7 +4159,7 @@ function bsb_bulletin_event_row( $item, $sunday_iso, $service_times, &$warnings 
 	$label = trim( (string) ( $item['ctaLabel'] ?? '' ) );
 	$item['ctaLabel'] = ( $label === '' && $url !== '' ) ? 'Learn More' : $label;
 	return array(
-		'title_and_date'              => bsb_bulletin_title_and_date( $item, $warnings ),
+		'title_and_date'              => bsb_bulletin_title_and_date( $item, $warnings, false ),
 		'content'                     => bsb_bulletin_content( $item, $sunday_iso, $service_times ),
 		'aande_button_label_and_link' => array(
 			'aande_button_label'   => (string) ( $item['ctaLabel'] ?? '' ),
