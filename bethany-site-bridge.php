@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.15.0
+ * Version:     0.16.0
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -241,6 +241,9 @@ add_action( 'rest_api_init', function () {
 	) );
 	register_rest_route( 'atlas/v1', '/bulletin/(?P<sunday>\\d{4}-\\d{2}-\\d{2})', array(
 		array( 'methods' => 'GET', 'callback' => 'bsb_bulletin_get', 'permission_callback' => 'bsb_bulletin_auth' ),
+	) );
+	register_rest_route( 'atlas/v1', '/bulletin/(?P<sunday>\\d{4}-\\d{2}-\\d{2})/order', array(
+		array( 'methods' => 'GET', 'callback' => 'bsb_bulletin_order_get', 'permission_callback' => 'bsb_bulletin_auth' ),
 	) );
 	register_rest_route( 'atlas/v1', '/bulletin/pco-credentials', array(
 		array( 'methods' => 'PUT', 'callback' => 'bsb_bulletin_put_pco', 'permission_callback' => $auth ),
@@ -4569,6 +4572,35 @@ function bsb_bulletin_push( WP_REST_Request $req ) {
 		'order_of_service_note' => $oos_note,
 		'warnings' => $warn,
 	) );
+}
+
+/**
+ * GET /bulletin/{sunday}/order — that Sunday's order of service from Planning Center, classified the same way
+ * as the website push (for Rock's print view, which has no Planning Center access of its own; v0.16.0).
+ * {plan_id, items: [{type, value, title}]} — type: pre song call anc fml wlk cmp ben com passage serm oth.
+ */
+function bsb_bulletin_order_get( WP_REST_Request $req ) {
+	$sunday = (string) $req->get_param( 'sunday' );
+	if ( ! bsb_bulletin_is_iso( $sunday ) ) {
+		return new WP_Error( 'bsb_bad_input', 'sunday must be yyyy-mm-dd', array( 'status' => 400 ) );
+	}
+	$plan = bsb_bulletin_pco_items( $sunday );
+	if ( is_wp_error( $plan ) ) {
+		return new WP_Error( 'bsb_pco', $plan->get_error_message(), array( 'status' => 502 ) );
+	}
+	if ( ! $plan ) {
+		return rest_ensure_response( array( 'plan_id' => null, 'items' => array() ) );
+	}
+	$skip = array( 'countdown', 'pre-service loop' );
+	$out  = array();
+	foreach ( $plan['items'] as $it ) {
+		if ( $it['itemType'] === 'header' || in_array( strtolower( trim( $it['title'] ) ), $skip, true ) ) {
+			continue;
+		}
+		list( $type, , $value ) = bsb_bulletin_classify( $it );
+		$out[] = array( 'type' => $type, 'value' => $value, 'title' => $it['title'] );
+	}
+	return rest_ensure_response( array( 'plan_id' => $plan['plan_id'], 'items' => $out ) );
 }
 
 /** GET /bulletin/{sunday} — what that Sunday's post holds, or 404. */
