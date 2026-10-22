@@ -25,6 +25,9 @@ Living backlog for the Bethany Site Bridge plugin. Ships by tag push (CI builds 
 
 ## Done (recent)
 
+- 0.17.0 — sermons module (`POST /sermons/push`, `POST /sermons/series`) for Rock's sermon push to the website +
+  Planning Center (rock-upgrades NEXT_STEPS "Sermons to the website"). Video stays with Atlas (BoxCast) / Vimeo for now.
+
 - 0.14.0 — bulletin module (`POST /bulletin`, `GET /bulletin/{sunday}`, `PUT /bulletin/pco-credentials`)
   for Rock RMS's bulletin build (rock-upgrades NEXT_STEPS "Bulletin in Rock"). Atlas still pushes the live
   bulletin until the cutover; Rock calls this in dry-run until then.

@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.16.3
+ * Version:     0.17.0
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -250,6 +250,13 @@ add_action( 'rest_api_init', function () {
 	) );
 	register_rest_route( 'atlas/v1', '/bulletin/pco-credentials', array(
 		array( 'methods' => 'PUT', 'callback' => 'bsb_bulletin_put_pco', 'permission_callback' => $auth ),
+	) );
+	// --- sermons --- (Rock's bulletin key or the master key; confirm-gated like the bulletin)
+	register_rest_route( 'atlas/v1', '/sermons/push', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_sermon_push', 'permission_callback' => 'bsb_bulletin_auth' ),
+	) );
+	register_rest_route( 'atlas/v1', '/sermons/series', array(
+		array( 'methods' => 'POST', 'callback' => 'bsb_sermon_series_push', 'permission_callback' => 'bsb_bulletin_auth' ),
 	) );
 	register_rest_route( 'atlas/v1', '/bulletin/rock-key', array(
 		array( 'methods' => 'PUT', 'callback' => 'bsb_bulletin_put_rock_key', 'permission_callback' => $auth ),
@@ -4821,6 +4828,583 @@ function bsb_bulletin_put_pco( WP_REST_Request $req ) {
 		'set_via'      => 'option',
 		'pco_check'    => is_wp_error( $check ) ? $check->get_error_message() : 'ok: Sunday service type readable',
 		'note'         => ( $now && $now[2] === 'constant' ) ? 'BSB_PCO_APP_ID / BSB_PCO_SECRET are defined and SHADOW this option.' : null,
+	) );
+}
+
+/* ================================================================== *
+ * MODULE: sermons — a Sunday's sermon post + Planning Center plan, and a series' term + artwork
+ * ================================================================== *
+ * Rock RMS is taking over Atlas's sermon push (rock-upgrades NEXT_STEPS "Sermons to the website"). Rock sends plain
+ * data; this ports Atlas's rules (actions/sermons.ts pushSermonWpCore, lib/scripture.ts):
+ *   POST /sermons/push   {date, title, passage, series, speaker, pco?, confirm}
+ *     the `sermons` post for that Sunday, found by its sermon_date (else by title) and updated in place: title,
+ *     scheduled for 1am that Sunday (published once the day has passed, never un-published), sermon_date, the
+ *     series / speaker / Bible book + chapter / passage terms, bulletin_link to that Sunday's bulletin post.
+ *     The video is left alone (Atlas's BoxCast embed or the edited Vimeo); a missing one is a warning.
+ *     Planning Center (pco=false skips): that Sunday's plan gets "Title (Passage)" only when its title is blank,
+ *     and the series name only when the plan has no series.
+ *   POST /sermons/series {name, image_url?, start_date?, dates[], confirm}
+ *     the sermon-series term (found or made) with series_start_date and series_image (the picture is downloaded from
+ *     image_url into the media library once per source URL), and in Planning Center the series behind those Sundays'
+ *     plans: renamed to `name` when it differs, artwork uploaded when the source picture changed.
+ * Both are confirm=true gated; without it the answer is the plan beside what is there now. Bulletin key or master key.
+ */
+
+/** Atlas lib/scripture.ts: first reference -> {book, chapter, passage}, or null when the book isn't certain. */
+function bsb_sermon_parse_scripture( $raw ) {
+	static $lookup = null;
+	if ( $lookup === null ) {
+		$lookup = array(
+			'gen' => 'Genesis', 'ex' => 'Exodus', 'exod' => 'Exodus', 'lev' => 'Leviticus', 'num' => 'Numbers', 'deut' => 'Deuteronomy',
+			'dt' => 'Deuteronomy', 'josh' => 'Joshua', 'judg' => 'Judges', 'jdg' => 'Judges', '1 sam' => '1 Samuel', '2 sam' => '2 Samuel',
+			'1 kgs' => '1 Kings', '2 kgs' => '2 Kings', '1 chr' => '1 Chronicles', '2 chr' => '2 Chronicles', 'neh' => 'Nehemiah',
+			'est' => 'Esther', 'ps' => 'Psalms', 'psa' => 'Psalms', 'psalm' => 'Psalms', 'prov' => 'Proverbs', 'prv' => 'Proverbs',
+			'eccl' => 'Ecclesiastes', 'ecc' => 'Ecclesiastes', 'song' => 'Song of Solomon', 'sos' => 'Song of Solomon', 'isa' => 'Isaiah',
+			'jer' => 'Jeremiah', 'lam' => 'Lamentations', 'ezek' => 'Ezekiel', 'ezk' => 'Ezekiel', 'dan' => 'Daniel', 'hos' => 'Hosea',
+			'obad' => 'Obadiah', 'jon' => 'Jonah', 'mic' => 'Micah', 'nah' => 'Nahum', 'hab' => 'Habakkuk', 'zeph' => 'Zephaniah',
+			'hag' => 'Haggai', 'zech' => 'Zechariah', 'mal' => 'Malachi', 'matt' => 'Matthew', 'mt' => 'Matthew', 'mk' => 'Mark',
+			'mrk' => 'Mark', 'lk' => 'Luke', 'jn' => 'John', 'jhn' => 'John', 'rom' => 'Romans', 'rm' => 'Romans',
+			'1 cor' => '1 Corinthians', '2 cor' => '2 Corinthians', 'gal' => 'Galatians', 'galations' => 'Galatians', 'eph' => 'Ephesians',
+			'phil' => 'Philippians', 'php' => 'Philippians', 'col' => 'Colossians', '1 thess' => '1 Thessalonians',
+			'2 thess' => '2 Thessalonians', '1 tim' => '1 Timothy', '2 tim' => '2 Timothy', 'philem' => 'Philemon', 'phm' => 'Philemon',
+			'heb' => 'Hebrews', 'jas' => 'James', '1 pet' => '1 Peter', '2 pet' => '2 Peter', 'rev' => 'Revelation',
+		);
+		$books = array( 'Genesis', 'Exodus', 'Leviticus', 'Numbers', 'Deuteronomy', 'Joshua', 'Judges', 'Ruth', '1 Samuel', '2 Samuel',
+			'1 Kings', '2 Kings', '1 Chronicles', '2 Chronicles', 'Ezra', 'Nehemiah', 'Esther', 'Job', 'Psalms', 'Proverbs', 'Ecclesiastes',
+			'Song of Solomon', 'Isaiah', 'Jeremiah', 'Lamentations', 'Ezekiel', 'Daniel', 'Hosea', 'Joel', 'Amos', 'Obadiah', 'Jonah', 'Micah',
+			'Nahum', 'Habakkuk', 'Zephaniah', 'Haggai', 'Zechariah', 'Malachi', 'Matthew', 'Mark', 'Luke', 'John', 'Acts', 'Romans',
+			'1 Corinthians', '2 Corinthians', 'Galatians', 'Ephesians', 'Philippians', 'Colossians', '1 Thessalonians', '2 Thessalonians',
+			'1 Timothy', '2 Timothy', 'Titus', 'Philemon', 'Hebrews', 'James', '1 Peter', '2 Peter', '1 John', '2 John', '3 John', 'Jude',
+			'Revelation' );
+		foreach ( $books as $b ) {
+			$lookup[ strtolower( $b ) ] = $b;
+		}
+	}
+	$raw = trim( (string) $raw );
+	if ( $raw === '' ) {
+		return null;
+	}
+	$first = trim( (string) preg_split( '/;| or /i', $raw )[0] );
+	$first = preg_replace( '/^[A-Za-z][A-Za-z ]*?:\s+(?=[A-Za-z])/', '', $first );
+	if ( ! preg_match( '/^\s*([123]\s+)?([A-Za-z][A-Za-z. ]*?)\.?\s*(\d+)?\s*(?::\s*([0-9\-–,\s]+))?\s*$/u', $first, $m ) ) {
+		return null;
+	}
+	$lead    = isset( $m[1] ) ? trim( $m[1] ) : '';
+	$key     = strtolower( trim( ( $lead !== '' ? $lead . ' ' : '' ) . rtrim( trim( $m[2] ), '.' ) ) );
+	$book    = isset( $lookup[ $key ] ) ? $lookup[ $key ] : null;
+	if ( ! $book ) {
+		return null;
+	}
+	$chapter = ! empty( $m[3] ) ? trim( $m[3] ) : null;
+	$verses  = ! empty( $m[4] ) ? str_replace( '–', '-', preg_replace( '/\s+/', '', $m[4] ) ) : null;
+	return array(
+		'book'    => $book,
+		'chapter' => $chapter ? $book . ' ' . $chapter : null,
+		'passage' => $chapter ? $book . ' ' . $chapter . ( $verses ? ':' . $verses : '' ) : $book,
+	);
+}
+
+/** An existing term by exact name (case-insensitive), under $parent when given. */
+function bsb_sermon_term( $taxonomy, $name, $parent = null ) {
+	$args = array( 'taxonomy' => $taxonomy, 'hide_empty' => false, 'name' => $name );
+	if ( $parent !== null ) {
+		$args['parent'] = (int) $parent;
+	}
+	$hits = get_terms( $args );
+	if ( is_wp_error( $hits ) || ! $hits ) {
+		return null;
+	}
+	foreach ( $hits as $t ) {
+		if ( strcasecmp( html_entity_decode( $t->name ), $name ) === 0 ) {
+			return $t;
+		}
+	}
+	return $hits[0];
+}
+
+/** The speaker term: exact name, else the one term ending in it ("Ritch Boerckel" -> "Dr. Ritch Boerckel"). */
+function bsb_sermon_speaker_term( $name ) {
+	$t = bsb_sermon_term( 'sermon_speaker', $name );
+	if ( $t ) {
+		return $t;
+	}
+	$hits = get_terms( array( 'taxonomy' => 'sermon_speaker', 'hide_empty' => false, 'search' => $name ) );
+	$ends = array();
+	foreach ( is_wp_error( $hits ) ? array() : $hits as $h ) {
+		$n = html_entity_decode( $h->name );
+		if ( strlen( $n ) > strlen( $name ) && strcasecmp( substr( $n, -strlen( $name ) ), $name ) === 0 ) {
+			$ends[] = $h;
+		}
+	}
+	return count( $ends ) === 1 ? $ends[0] : null;
+}
+
+/** Term id, made when missing (writes only on a live run). */
+function bsb_sermon_term_id( $taxonomy, $name, $existing, $parent = 0 ) {
+	if ( $existing ) {
+		return (int) $existing->term_id;
+	}
+	$made = wp_insert_term( $name, $taxonomy, $parent ? array( 'parent' => (int) $parent ) : array() );
+	if ( is_wp_error( $made ) ) {
+		$id = $made->get_error_data( 'term_exists' );
+		return $id ? (int) $id : 0;
+	}
+	return (int) $made['term_id'];
+}
+
+/** ACF write by field KEY (read off an existing post of the type), so a brand-new post gets a working field. */
+function bsb_sermon_acf( $name, $value, $target ) {
+	static $keys = array();
+	if ( ! array_key_exists( $name, $keys ) ) {
+		global $wpdb;
+		$keys[ $name ] = (string) $wpdb->get_var( $wpdb->prepare(
+			"SELECT pm.meta_value FROM {$wpdb->postmeta} pm JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+			 WHERE p.post_type = 'sermons' AND pm.meta_key = %s AND pm.meta_value LIKE 'field\\_%%' LIMIT 1", '_' . $name ) );
+	}
+	return update_field( $keys[ $name ] !== '' ? $keys[ $name ] : $name, $value, $target );
+}
+
+/* ---------- Planning Center writes ---------- */
+
+function bsb_sermon_pco_send( $method, $path, $data, $cred ) {
+	$res = wp_remote_request( 'https://api.planningcenteronline.com/services/v2' . $path, array(
+		'method'  => $method,
+		'timeout' => 30,
+		'headers' => array( 'Authorization' => 'Basic ' . base64_encode( $cred[0] . ':' . $cred[1] ), 'Content-Type' => 'application/json' ),
+		'body'    => wp_json_encode( array( 'data' => $data ) ),
+	) );
+	if ( is_wp_error( $res ) ) {
+		return $res;
+	}
+	$code = (int) wp_remote_retrieve_response_code( $res );
+	if ( $code < 200 || $code >= 300 ) {
+		return new WP_Error( 'bsb_pco_http', 'Planning Center answered HTTP ' . $code . ' for ' . $method . ' ' . $path . ': ' . substr( wp_remote_retrieve_body( $res ), 0, 300 ) );
+	}
+	return json_decode( wp_remote_retrieve_body( $res ), true );
+}
+
+/** That Sunday's Sunday Service plan {id, title, series_title, series_id}, null when none, WP_Error on failure. */
+function bsb_sermon_pco_plan( $date, $cred ) {
+	$base = '/service_types/' . BSB_PCO_SUNDAY_SERVICE_TYPE . '/plans';
+	$q    = '?filter=after&after=' . gmdate( 'Y-m-d', bsb_bulletin_ts( $date ) - DAY_IN_SECONDS ) . '&order=sort_date&include=series&per_page=5';
+	$list = bsb_bulletin_pco_get( $base . $q, $cred );
+	if ( is_wp_error( $list ) ) {
+		return $list;
+	}
+	$series = array();
+	foreach ( (array) ( $list['included'] ?? array() ) as $inc ) {
+		if ( ( $inc['type'] ?? '' ) === 'Series' ) {
+			$series[ $inc['id'] ] = $inc['attributes'];
+		}
+	}
+	foreach ( (array) ( $list['data'] ?? array() ) as $p ) {
+		if ( substr( (string) ( $p['attributes']['sort_date'] ?? '' ), 0, 10 ) !== $date ) {
+			continue;
+		}
+		$sid = $p['relationships']['series']['data']['id'] ?? null;
+		return array(
+			'id'           => (string) $p['id'],
+			'title'        => trim( (string) ( $p['attributes']['title'] ?? '' ) ),
+			'series_title' => (string) ( $p['attributes']['series_title'] ?? '' ),
+			'series_id'    => $sid ? (string) $sid : null,
+			'series'       => $sid && isset( $series[ $sid ] ) ? $series[ $sid ] : null,
+		);
+	}
+	return null;
+}
+
+/** Download a picture (image/* only, 15 MB cap) -> {bytes, mime, ext} or WP_Error. */
+function bsb_sermon_fetch_image( $url ) {
+	if ( ! preg_match( '#^https://#i', (string) $url ) ) {
+		return new WP_Error( 'bsb_bad_input', 'image_url must be an https address' );
+	}
+	$res = wp_remote_get( $url, array( 'timeout' => 45, 'redirection' => 3 ) );
+	if ( is_wp_error( $res ) ) {
+		return $res;
+	}
+	$code = (int) wp_remote_retrieve_response_code( $res );
+	$mime = strtolower( trim( explode( ';', (string) wp_remote_retrieve_header( $res, 'content-type' ) )[0] ) );
+	$body = (string) wp_remote_retrieve_body( $res );
+	if ( $code !== 200 || strpos( $mime, 'image/' ) !== 0 || $body === '' ) {
+		return new WP_Error( 'bsb_image', 'The series picture did not download (HTTP ' . $code . ', ' . ( $mime ?: 'no type' ) . ')' );
+	}
+	if ( strlen( $body ) > 15 * 1024 * 1024 ) {
+		return new WP_Error( 'bsb_image', 'The series picture is over 15 MB' );
+	}
+	$ext = array( 'image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp', 'image/gif' => 'gif' );
+	return array( 'bytes' => $body, 'mime' => $mime, 'ext' => $ext[ $mime ] ?? 'jpg' );
+}
+
+/** Upload bytes to Planning Center's file service -> upload id, or WP_Error. */
+function bsb_sermon_pco_upload( $img, $filename, $cred ) {
+	$b    = wp_generate_password( 24, false );
+	$body = '--' . $b . "\r\n" . 'Content-Disposition: form-data; name="file"; filename="' . $filename . '"' . "\r\n"
+		. 'Content-Type: ' . $img['mime'] . "\r\n\r\n" . $img['bytes'] . "\r\n" . '--' . $b . "--\r\n";
+	$res  = wp_remote_post( 'https://upload.planningcenteronline.com/v2/files', array(
+		'timeout' => 60,
+		'headers' => array( 'Authorization' => 'Basic ' . base64_encode( $cred[0] . ':' . $cred[1] ), 'Content-Type' => 'multipart/form-data; boundary=' . $b ),
+		'body'    => $body,
+	) );
+	if ( is_wp_error( $res ) ) {
+		return $res;
+	}
+	$j = json_decode( wp_remote_retrieve_body( $res ), true );
+	$id = $j['data'][0]['id'] ?? '';
+	return $id !== '' ? (string) $id : new WP_Error( 'bsb_pco_upload', 'Planning Center did not accept the picture (HTTP ' . wp_remote_retrieve_response_code( $res ) . ')' );
+}
+
+/**
+ * The sermons post for a Sunday: by sermon_date; else ONE post with exactly this title and no sermon date of its own.
+ * Stricter than bsb_bulletin_sermon_post() (which may take a loose title hit) because this one writes.
+ */
+function bsb_sermon_find( $date, $title ) {
+	$st  = array( 'publish', 'future', 'draft', 'pending', 'private' );
+	$ids = get_posts( array( 'post_type' => 'sermons', 'post_status' => $st, 'posts_per_page' => 2, 'fields' => 'ids',
+		'meta_key' => 'sermon_date', 'meta_value' => str_replace( '-', '', $date ) ) );
+	if ( $ids ) {
+		return get_post( (int) $ids[0] );
+	}
+	$hits = array();
+	foreach ( get_posts( array( 'post_type' => 'sermons', 'post_status' => $st, 'posts_per_page' => 20, 's' => $title ) ) as $p ) {
+		if ( strcasecmp( trim( $p->post_title ), $title ) === 0 && trim( (string) get_post_meta( $p->ID, 'sermon_date', true ) ) === '' ) {
+			$hits[] = $p;
+		}
+	}
+	return count( $hits ) === 1 ? $hits[0] : null;
+}
+
+/* ---------- POST /sermons/push ---------- */
+
+function bsb_sermon_push( WP_REST_Request $req ) {
+	if ( ! post_type_exists( 'sermons' ) ) {
+		return new WP_Error( 'bsb_no_sermons_type', 'The sermons post type is not registered on this site', array( 'status' => 501 ) );
+	}
+	$date    = (string) $req->get_param( 'date' );
+	$title   = trim( (string) $req->get_param( 'title' ) );
+	$passage = trim( (string) $req->get_param( 'passage' ) );
+	$sname   = trim( (string) $req->get_param( 'series' ) );
+	$speaker = trim( (string) $req->get_param( 'speaker' ) );
+	if ( ! bsb_bulletin_is_iso( $date ) || gmdate( 'w', bsb_bulletin_ts( $date ) ) !== '0' ) {
+		return new WP_Error( 'bsb_bad_input', 'date must be a yyyy-mm-dd Sunday', array( 'status' => 400 ) );
+	}
+	if ( $title === '' ) {
+		return new WP_Error( 'bsb_bad_input', 'title is required', array( 'status' => 400 ) );
+	}
+	$live = filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN );
+	$warn = array();
+
+	// ---- website plan ----
+	$existing = bsb_sermon_find( $date, $title );
+	$when     = $date . ' 01:00:00';
+	$past     = $date <= wp_date( 'Y-m-d' );
+	$status   = ( $past || ( $existing && $existing->post_status === 'publish' ) ) ? 'publish' : 'future';
+	$parsed   = bsb_sermon_parse_scripture( $passage );
+	if ( $passage !== '' && ! $parsed ) {
+		$warn[] = 'Couldn\'t read the Bible book in "' . $passage . '", so the book and passage tags are left as they are.';
+	}
+	$t_series  = $sname !== '' ? bsb_sermon_term( 'sermon-series', $sname ) : null;
+	$t_speaker = $speaker !== '' ? bsb_sermon_speaker_term( $speaker ) : null;
+	$t_book    = $parsed ? bsb_sermon_term( 'sermon_books', $parsed['book'], 0 ) : null;
+	$t_chapter = ( $parsed && $parsed['chapter'] && $t_book ) ? bsb_sermon_term( 'sermon_books', $parsed['chapter'], $t_book->term_id ) : null;
+	$t_passage = $parsed ? bsb_sermon_term( 'sermon-passage', $parsed['passage'] ) : null;
+	$bulletin  = bsb_bulletin_find( $date );
+	if ( ! $bulletin ) {
+		$warn[] = 'No bulletin post for ' . $date . ' yet, so the sermon\'s bulletin link stays empty until it is sent again.';
+	}
+	$video = $existing ? (string) get_post_meta( $existing->ID, 'video_embed', true ) : '';
+	if ( trim( $video ) === '' ) {
+		$warn[] = 'No video on the post yet. Add it after Sunday (the edited Vimeo), or from Atlas for the BoxCast stream.';
+	}
+	$name_of = function ( $t, $want ) { return $t ? html_entity_decode( $t->name ) . ' (existing)' : ( $want !== '' ? $want . ' (new)' : null ); };
+	$wp_plan = array(
+		'action'       => $existing ? 'update' : 'create',
+		'post_id'      => $existing ? (int) $existing->ID : null,
+		'title'        => $title,
+		'status'       => $status,
+		'publish_date' => $when,
+		'series'       => $name_of( $t_series, $sname ),
+		'speaker'      => $name_of( $t_speaker, $speaker ),
+		'book'         => $parsed ? $name_of( $t_book, $parsed['book'] ) : null,
+		'chapter'      => $parsed && $parsed['chapter'] ? $name_of( $t_chapter, $parsed['chapter'] ) : null,
+		'passage'      => $parsed ? $name_of( $t_passage, $parsed['passage'] ) : null,
+		'bulletin_id'  => $bulletin ? (int) $bulletin->ID : null,
+		'now'          => $existing ? array( 'title' => $existing->post_title, 'status' => $existing->post_status, 'publish_date' => $existing->post_date, 'has_video' => trim( $video ) !== '' ) : null,
+	);
+
+	// ---- Planning Center plan ----
+	$pco = array( 'skipped' => true );
+	if ( (string) $req->get_param( 'pco' ) !== 'false' && $req->get_param( 'pco' ) !== false ) {
+		$cred = bsb_bulletin_pco_credentials();
+		$plan = $cred ? bsb_sermon_pco_plan( $date, $cred ) : new WP_Error( 'bsb_pco_no_keys', 'No Planning Center keys on the site' );
+		if ( is_wp_error( $plan ) ) {
+			$pco    = array( 'error' => $plan->get_error_message() );
+			$warn[] = 'Planning Center: ' . $plan->get_error_message();
+		} elseif ( ! $plan ) {
+			$pco    = array( 'plan_id' => null );
+			$warn[] = 'Planning Center has no Sunday Service plan for ' . $date . ' yet.';
+		} else {
+			$set = array();
+			if ( $plan['title'] === '' ) {
+				$set['title'] = $title . ( $passage !== '' ? ' (' . $passage . ')' : '' );
+			}
+			if ( ! $plan['series_id'] && $sname !== '' ) {
+				$set['series_title'] = $sname;
+			}
+			$pco = array( 'plan_id' => $plan['id'], 'title_now' => $plan['title'], 'series_now' => $plan['series_title'], 'set' => (object) $set );
+			if ( $plan['series_id'] && $sname !== '' && strcasecmp( $plan['series_title'], $sname ) !== 0 ) {
+				$warn[] = 'Planning Center calls this Sunday\'s series "' . $plan['series_title'] . '". Send the series to rename it.';
+			}
+			if ( $live && $set ) {
+				$r = bsb_sermon_pco_send( 'PATCH', '/service_types/' . BSB_PCO_SUNDAY_SERVICE_TYPE . '/plans/' . $plan['id'],
+					array( 'type' => 'Plan', 'id' => $plan['id'], 'attributes' => $set ), $cred );
+				if ( is_wp_error( $r ) ) {
+					$pco['error'] = $r->get_error_message();
+					$warn[]       = 'Planning Center: ' . $r->get_error_message();
+				} else {
+					$pco['updated'] = true;
+				}
+			}
+		}
+	}
+
+	if ( ! $live ) {
+		return rest_ensure_response( array( 'dry_run' => true, 'date' => $date, 'website' => $wp_plan, 'planning_center' => $pco, 'warnings' => $warn ) );
+	}
+
+	// ---- website write ----
+	$args = array( 'post_type' => 'sermons', 'post_title' => $title, 'post_status' => $status, 'post_date' => $when, 'post_date_gmt' => get_gmt_from_date( $when ) );
+	if ( $existing ) {
+		$args['ID'] = (int) $existing->ID;
+		if ( $existing->post_status === 'publish' ) {   // never move a published sermon's date
+			unset( $args['post_date'], $args['post_date_gmt'] );
+		}
+		$id = wp_update_post( wp_slash( $args ), true );
+	} else {
+		$id = wp_insert_post( wp_slash( $args ), true );
+	}
+	if ( is_wp_error( $id ) ) {
+		return new WP_Error( 'bsb_write_failed', 'The sermon post did not save: ' . $id->get_error_message(), array( 'status' => 500 ) );
+	}
+	$id = (int) $id;
+	if ( function_exists( 'update_field' ) ) {
+		bsb_sermon_acf( 'sermon_date', str_replace( '-', '', $date ), $id );
+		if ( $bulletin ) {
+			bsb_sermon_acf( 'bulletin_link', array( (int) $bulletin->ID ), $id );
+		}
+	} else {
+		update_post_meta( $id, 'sermon_date', str_replace( '-', '', $date ) );
+		$warn[] = 'ACF is not active, so the bulletin link was not set.';
+	}
+	if ( $sname !== '' ) {
+		wp_set_object_terms( $id, array( bsb_sermon_term_id( 'sermon-series', $sname, $t_series ) ), 'sermon-series' );
+	}
+	if ( $speaker !== '' ) {
+		wp_set_object_terms( $id, array( bsb_sermon_term_id( 'sermon_speaker', $speaker, $t_speaker ) ), 'sermon_speaker' );
+	}
+	if ( $parsed ) {
+		$book_id = bsb_sermon_term_id( 'sermon_books', $parsed['book'], $t_book );
+		$books   = array( $book_id );
+		if ( $parsed['chapter'] && $book_id ) {
+			$books[] = bsb_sermon_term_id( 'sermon_books', $parsed['chapter'], $t_chapter, $book_id );
+		}
+		wp_set_object_terms( $id, array_values( array_filter( $books ) ), 'sermon_books' );
+		wp_set_object_terms( $id, array( bsb_sermon_term_id( 'sermon-passage', $parsed['passage'], $t_passage ) ), 'sermon-passage' );
+	}
+	$p = get_post( $id );
+	return rest_ensure_response( array(
+		'date'            => $date,
+		'website'         => array(
+			'action'       => $existing ? 'updated' : 'created',
+			'post_id'      => $id,
+			'link'         => get_permalink( $p ),
+			'status'       => $p->post_status,
+			'publish_date' => $p->post_date,
+			'series'       => wp_get_object_terms( $id, 'sermon-series', array( 'fields' => 'names' ) ),
+			'speaker'      => wp_get_object_terms( $id, 'sermon_speaker', array( 'fields' => 'names' ) ),
+			'books'        => wp_get_object_terms( $id, 'sermon_books', array( 'fields' => 'names' ) ),
+			'passage'      => wp_get_object_terms( $id, 'sermon-passage', array( 'fields' => 'names' ) ),
+			'bulletin_id'  => $bulletin ? (int) $bulletin->ID : null,
+			'has_video'    => trim( (string) get_post_meta( $id, 'video_embed', true ) ) !== '',
+		),
+		'planning_center' => $pco,
+		'warnings'        => $warn,
+	) );
+}
+
+/* ---------- POST /sermons/series ---------- */
+
+function bsb_sermon_series_push( WP_REST_Request $req ) {
+	$name  = trim( (string) $req->get_param( 'name' ) );
+	$img   = trim( (string) $req->get_param( 'image_url' ) );
+	$start = (string) $req->get_param( 'start_date' );
+	$dates = array_values( array_filter( (array) $req->get_param( 'dates' ), 'bsb_bulletin_is_iso' ) );
+	if ( $name === '' ) {
+		return new WP_Error( 'bsb_bad_input', 'name is required', array( 'status' => 400 ) );
+	}
+	if ( $start !== '' && ! bsb_bulletin_is_iso( $start ) ) {
+		return new WP_Error( 'bsb_bad_input', 'start_date must be yyyy-mm-dd', array( 'status' => 400 ) );
+	}
+	$live = filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN );
+	$warn = array();
+
+	// ---- website: the series term ----
+	$term     = bsb_sermon_term( 'sermon-series', $name );
+	$tkey     = $term ? 'term_' . $term->term_id : null;
+	$cur_img  = ( $term && function_exists( 'get_field' ) ) ? (int) get_field( 'series_image', $tkey, false ) : 0;
+	$cur_src  = $term ? (string) get_term_meta( $term->term_id, 'bsb_series_image_source', true ) : '';
+	$need_img = $img !== '' && ( ! $cur_img || $cur_src !== $img );
+	if ( $img === '' ) {
+		$warn[] = 'No series picture yet, so the website and Planning Center artwork are left as they are.';
+	}
+	$web = array(
+		'term'        => $term ? array( 'id' => (int) $term->term_id, 'name' => html_entity_decode( $term->name ), 'link' => get_term_link( $term ) ) : array( 'new' => $name ),
+		'start_date'  => $start !== '' ? $start : null,
+		'image'       => $img === '' ? 'left as is' : ( $need_img ? 'upload from ' . $img : 'already this picture (media ' . $cur_img . ')' ),
+		'image_now'   => $cur_img ?: null,
+	);
+
+	// ---- Planning Center: the series behind those Sundays' plans ----
+	$pco   = array( 'skipped' => true );
+	$cred  = null;
+	$sids  = array();
+	$plans = array();
+	if ( (string) $req->get_param( 'pco' ) !== 'false' && $dates ) {
+		$cred = bsb_bulletin_pco_credentials();
+		if ( ! $cred ) {
+			$warn[] = 'Planning Center: no keys on the site';
+		} else {
+			foreach ( $dates as $d ) {
+				$pl = bsb_sermon_pco_plan( $d, $cred );
+				if ( is_wp_error( $pl ) ) {
+					$warn[] = 'Planning Center ' . $d . ': ' . $pl->get_error_message();
+				} elseif ( $pl ) {
+					$plans[ $d ] = $pl;
+					if ( $pl['series_id'] ) {
+						$sids[ $pl['series_id'] ] = $pl['series'];
+					}
+				}
+			}
+			$art_src = json_decode( (string) bsb_option_read( 'bsb_pco_series_art' ), true );
+			$art_src = is_array( $art_src ) ? $art_src : array();
+			$pco     = array( 'plans' => count( $plans ) . ' of ' . count( $dates ) . ' Sundays have a plan', 'series' => array() );
+			foreach ( $sids as $sid => $s ) {
+				$pco['series'][] = array(
+					'id'       => $sid,
+					'name_now' => $s['title'] ?? '',
+					'rename'   => strcasecmp( (string) ( $s['title'] ?? '' ), $name ) !== 0 ? $name : null,
+					'artwork'  => $img === '' ? 'left as is' : ( empty( $s['has_artwork'] ) || ( $art_src[ $sid ] ?? '' ) !== $img ? 'upload' : 'already this picture' ),
+				);
+			}
+			$loose = array_keys( array_filter( $plans, function ( $p ) { return ! $p['series_id']; } ) );
+			if ( $loose ) {
+				$pco['series_title_on'] = $loose;
+			}
+		}
+	}
+
+	if ( ! $live ) {
+		return rest_ensure_response( array( 'dry_run' => true, 'name' => $name, 'website' => $web, 'planning_center' => $pco, 'warnings' => $warn ) );
+	}
+
+	// ---- website write ----
+	$tid = bsb_sermon_term_id( 'sermon-series', $name, $term );
+	if ( ! $tid ) {
+		return new WP_Error( 'bsb_write_failed', 'The series could not be made on the website', array( 'status' => 500 ) );
+	}
+	$tkey  = 'term_' . $tid;
+	$photo = null;
+	if ( $img !== '' ) {
+		$photo = bsb_sermon_fetch_image( $img );
+		if ( is_wp_error( $photo ) ) {
+			$warn[] = $photo->get_error_message();
+			$photo  = null;
+		}
+	}
+	if ( function_exists( 'update_field' ) ) {
+		if ( $start !== '' ) {
+			update_field( 'series_start_date', str_replace( '-', '', $start ), $tkey );
+		}
+		if ( $need_img && $photo ) {
+			$fn = sanitize_file_name( $name . '-Series-Graphic.' . $photo['ext'] );
+			$up = wp_upload_bits( $fn, null, $photo['bytes'] );
+			if ( ! empty( $up['error'] ) ) {
+				$warn[] = 'Website picture upload failed: ' . $up['error'];
+			} else {
+				$att = wp_insert_attachment( array( 'post_mime_type' => $photo['mime'], 'post_title' => $name . ' Series Graphic', 'post_content' => '', 'post_status' => 'inherit' ), $up['file'], 0, true );
+				if ( is_wp_error( $att ) ) {
+					$warn[] = 'Website picture attachment failed: ' . $att->get_error_message();
+				} else {
+					require_once ABSPATH . 'wp-admin/includes/image.php';
+					wp_update_attachment_metadata( $att, wp_generate_attachment_metadata( $att, $up['file'] ) );
+					update_field( 'series_image', (int) $att, $tkey );
+					update_term_meta( $tid, 'bsb_series_image_source', $img );
+				}
+			}
+		}
+	} else {
+		$warn[] = 'ACF is not active, so the series picture and start date were not set.';
+	}
+
+	// ---- Planning Center write ----
+	if ( $cred && $plans ) {
+		foreach ( array_keys( array_filter( $plans, function ( $p ) { return ! $p['series_id']; } ) ) as $d ) {
+			$r = bsb_sermon_pco_send( 'PATCH', '/service_types/' . BSB_PCO_SUNDAY_SERVICE_TYPE . '/plans/' . $plans[ $d ]['id'],
+				array( 'type' => 'Plan', 'id' => $plans[ $d ]['id'], 'attributes' => array( 'series_title' => $name ) ), $cred );
+			if ( is_wp_error( $r ) ) {
+				$warn[] = 'Planning Center ' . $d . ': ' . $r->get_error_message();
+			} else {
+				$again = bsb_sermon_pco_plan( $d, $cred );
+				if ( ! is_wp_error( $again ) && $again && $again['series_id'] ) {
+					$sids[ $again['series_id'] ] = $again['series'];
+				}
+			}
+		}
+		$art_src = json_decode( (string) bsb_option_read( 'bsb_pco_series_art' ), true );
+		$art_src = is_array( $art_src ) ? $art_src : array();
+		$done    = array();
+		foreach ( $sids as $sid => $s ) {
+			$attrs = array();
+			if ( strcasecmp( (string) ( $s['title'] ?? '' ), $name ) !== 0 ) {
+				$attrs['title'] = $name;
+			}
+			if ( $photo && ( empty( $s['has_artwork'] ) || ( $art_src[ $sid ] ?? '' ) !== $img ) ) {
+				$up = bsb_sermon_pco_upload( $photo, sanitize_file_name( $name . '-Series-Graphic.' . $photo['ext'] ), $cred );
+				if ( is_wp_error( $up ) ) {
+					$warn[] = 'Planning Center artwork: ' . $up->get_error_message();
+				} else {
+					$attrs['artwork_file'] = $up;
+				}
+			}
+			if ( ! $attrs ) {
+				$done[] = array( 'id' => $sid, 'changed' => false );
+				continue;
+			}
+			$r = bsb_sermon_pco_send( 'PATCH', '/series/' . $sid, array( 'type' => 'Series', 'id' => $sid, 'attributes' => $attrs ), $cred );
+			if ( is_wp_error( $r ) ) {
+				$warn[] = 'Planning Center series ' . $sid . ': ' . $r->get_error_message();
+				continue;
+			}
+			if ( isset( $attrs['artwork_file'] ) ) {
+				$art_src[ $sid ] = $img;
+			}
+			$done[] = array( 'id' => $sid, 'title' => $r['data']['attributes']['title'] ?? null, 'has_artwork' => ! empty( $r['data']['attributes']['has_artwork'] ),
+				'renamed' => isset( $attrs['title'] ), 'artwork_uploaded' => isset( $attrs['artwork_file'] ) );
+		}
+		bsb_option_write( 'bsb_pco_series_art', wp_json_encode( $art_src ) );
+		$pco = array( 'plans' => count( $plans ), 'series' => $done );
+	}
+
+	$t = get_term( $tid, 'sermon-series' );
+	return rest_ensure_response( array(
+		'name'            => $name,
+		'website'         => array(
+			'term_id'    => $tid,
+			'link'       => get_term_link( $t ),
+			'start_date' => function_exists( 'get_field' ) ? get_field( 'series_start_date', $tkey, false ) : null,
+			'image_id'   => function_exists( 'get_field' ) ? (int) get_field( 'series_image', $tkey, false ) : null,
+		),
+		'planning_center' => $pco,
+		'warnings'        => $warn,
 	) );
 }
 

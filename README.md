@@ -19,6 +19,7 @@ reason to hide it; not intended as a general-purpose plugin.
 | `content` | Find text across post content, post meta (Cornerstone builder JSON included — JSON-escaped slashes are searched too) and options; serialized-safe replace with a dry run listing every row |
 | `files` | Read/write files under `wp-content/mu-plugins` and the active child theme — the SFTP replacement. Base64 transport (the host firewall rejects PHP in request bodies), PHP syntax lint before any write, redeclaration check, backups outside the auto-loaded dirs, sha1-checked overwrites, restore |
 | `bulletin` | Builds a Sunday's `bulletin` post from plain item data sent by Rock RMS (`POST /bulletin`, dry run by default; Rock uses its own bulletin-only `X-Bulletin-Key`): Atlas's ACF mapping in PHP, order of service from Planning Center, scheduled for Friday 9:30 |
+| `sermons` | Rock RMS's sermon push: `POST /sermons/push` builds or updates a Sunday's `sermons` post (title, 1am schedule, series/speaker/book/passage tags, bulletin link) and fills that Sunday's Planning Center plan title (only when blank) and series (only when missing); `POST /sermons/series` sets the series term's start date + picture and renames the Planning Center series + uploads its artwork. Bulletin key or master key; dry run by default |
 | `updater` | One-click updates from this repo's releases |
 
 ### Why the events module exists
@@ -78,6 +79,8 @@ Base: `<site>/wp-json/atlas/v1`
 | `PUT /files/{root}` | Write `{path, ...}`:  `{content_base64, expected_sha1 (required when the file exists), force?}`. Requires `confirm=true`. .php is linted first (`php -l`, else `token_get_all(TOKEN_PARSE)`, else `opcache_compile_file`), refused on syntax error or probable redeclaration; the previous version is backed up and its name returned |
 | `DELETE /files/{root}` | `{path}` moves the file to backups. Requires `confirm=true` |
 | `POST /files/restore` | `{root, path, backup}` puts a backup back (current file backed up first). Requires `confirm=true` |
+| `POST /sermons/push` | `{date, title, passage, series, speaker, pco?, confirm}` — one Sunday's sermon post + Planning Center plan. Without `confirm=true` returns the plan beside what is there now |
+| `POST /sermons/series` | `{name, image_url?, start_date?, dates[], confirm}` — the series term (start date, picture downloaded once per source URL) and the Planning Center series behind those Sundays' plans (renamed; artwork uploaded when the picture changed) |
 
 `{ref}` = post ID, TEC provisional occurrence ID, or slug. **Prefer the slug** — it
 always resolves to the parent post.
