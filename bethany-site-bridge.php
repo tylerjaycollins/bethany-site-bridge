@@ -6,7 +6,7 @@
  *              recurrence (including "will not occur" dates), none of which core
  *              or plugin REST APIs expose — plus the site's custom PHP tweaks
  *              (formerly Code Snippets). Consumed by Atlas and by Claude Code.
- * Version:     0.17.0
+ * Version:     0.17.1
  * Author:      Tyler Collins
  * License:     GPL-2.0-or-later
  * Update URI:  https://github.com/tylerjaycollins/bethany-site-bridge
@@ -4840,7 +4840,8 @@ function bsb_bulletin_put_pco( WP_REST_Request $req ) {
  *     the `sermons` post for that Sunday, found by its sermon_date (else by title) and updated in place: title,
  *     scheduled for 1am that Sunday (published once the day has passed, never un-published), sermon_date, the
  *     series / speaker / Bible book + chapter / passage terms, bulletin_link to that Sunday's bulletin post.
- *     The video is left alone (Atlas's BoxCast embed or the edited Vimeo); a missing one is a warning.
+ *     A post with no video gets that Sunday's BoxCast stream (bsb_sermon_boxcast); a video already there (the edited
+ *     Vimeo) is never replaced. No broadcast yet / BoxCast unreachable is a warning, and sending again fills it.
  *     Planning Center (pco=false skips): that Sunday's plan gets "Title (Passage)" only when its title is blank,
  *     and the series name only when the plan has no series.
  *   POST /sermons/series {name, image_url?, start_date?, dates[], confirm}
@@ -4962,6 +4963,55 @@ function bsb_sermon_acf( $name, $value, $target ) {
 			 WHERE p.post_type = 'sermons' AND pm.meta_key = %s AND pm.meta_value LIKE 'field\\_%%' LIMIT 1", '_' . $name ) );
 	}
 	return update_field( $keys[ $name ] !== '' ? $keys[ $name ] : $name, $value, $target );
+}
+
+/* ---------- BoxCast (public API, no key) ---------- */
+
+/**
+ * That Sunday's BoxCast broadcast -> {name, embed}, null when there is none, WP_Error when BoxCast can't be reached.
+ * Atlas lib/boxcast.ts ported: matched by the UTC date of starts_at (the service streams ~8:50am Central, same day in UTC),
+ * preferring a "sunday-services" broadcast over other events streamed that day. The embed is BoxCast's Inline Frame
+ * (no <script>, so the host firewall lets it through) with Bethany's player options, the same markup Atlas wrote.
+ */
+function bsb_sermon_boxcast( $date ) {
+	$found = array();
+	foreach ( array( 'current&s=starts_at', 'future&s=starts_at', 'past&s=-starts_at' ) as $q ) {
+		$r = wp_remote_get( 'https://api.boxcast.com/channels/trefcsz2m92tog6sfrwb/broadcasts?q=timeframe:' . $q . '&l=50', array( 'timeout' => 15 ) );
+		if ( is_wp_error( $r ) ) {
+			return $r;
+		}
+		if ( wp_remote_retrieve_response_code( $r ) !== 200 ) {
+			return new WP_Error( 'bsb_boxcast', 'BoxCast answered ' . wp_remote_retrieve_response_code( $r ) );
+		}
+		foreach ( (array) json_decode( wp_remote_retrieve_body( $r ), true ) as $b ) {
+			if ( substr( (string) ( $b['starts_at'] ?? '' ), 0, 10 ) === $date && ! empty( $b['channel_id'] ) ) {
+				$found[] = $b;
+			}
+		}
+		if ( $found ) {
+			break;
+		}
+	}
+	if ( ! $found ) {
+		return null;
+	}
+	$pick = $found[0];
+	foreach ( $found as $b ) {
+		if ( strpos( (string) $b['channel_id'], 'sunday-services' ) === 0 ) {
+			$pick = $b;
+			break;
+		}
+	}
+	$params = http_build_query( array(
+		'showTitle' => '0', 'showDescription' => '0', 'showHighlights' => '0', 'showRelated' => '0', 'defaultVideo' => 'next',
+		'playInline' => '0', 'dvr' => '1', 'market' => 'house-of-worship', 'showCountdown' => '0', 'showDonations' => '0',
+		'showDocuments' => '0', 'showIndex' => '0', 'showChat' => '0', 'hidePreBroadcastTextOverlay' => '0', 'autoplay' => '0',
+	) );
+	return array(
+		'name'  => (string) ( $pick['name'] ?? '' ),
+		'embed' => '<iframe width="720" height="800" src="https://boxcast.tv/view-embed/' . rawurlencode( (string) $pick['channel_id'] ) . '?' . $params
+			. '" frameBorder="0" scrolling="auto" allowfullscreen="true" allow="autoplay; fullscreen"></iframe>',
+	);
 }
 
 /* ---------- Planning Center writes ---------- */
@@ -5112,8 +5162,15 @@ function bsb_sermon_push( WP_REST_Request $req ) {
 		$warn[] = 'No bulletin post for ' . $date . ' yet, so the sermon\'s bulletin link stays empty until it is sent again.';
 	}
 	$video = $existing ? (string) get_post_meta( $existing->ID, 'video_embed', true ) : '';
+	$bc    = null;   // that Sunday's BoxCast stream, only looked up when the post has no video yet (never replaces the Vimeo)
 	if ( trim( $video ) === '' ) {
-		$warn[] = 'No video on the post yet. Add it after Sunday (the edited Vimeo), or from Atlas for the BoxCast stream.';
+		$bc = bsb_sermon_boxcast( $date );
+		if ( is_wp_error( $bc ) ) {
+			$warn[] = 'Couldn\'t reach BoxCast (' . $bc->get_error_message() . '), so the post has no video yet. Send it again to retry.';
+			$bc     = null;
+		} elseif ( ! $bc ) {
+			$warn[] = 'BoxCast has no broadcast on ' . $date . ' yet, so the post has no video. Schedule it in BoxCast, then send again.';
+		}
 	}
 	$name_of = function ( $t, $want ) { return $t ? html_entity_decode( $t->name ) . ' (existing)' : ( $want !== '' ? $want . ' (new)' : null ); };
 	$wp_plan = array(
@@ -5128,6 +5185,7 @@ function bsb_sermon_push( WP_REST_Request $req ) {
 		'chapter'      => $parsed && $parsed['chapter'] ? $name_of( $t_chapter, $parsed['chapter'] ) : null,
 		'passage'      => $parsed ? $name_of( $t_passage, $parsed['passage'] ) : null,
 		'bulletin_id'  => $bulletin ? (int) $bulletin->ID : null,
+		'video'        => trim( $video ) !== '' ? 'keeps the video already on the post' : ( $bc ? 'BoxCast stream: ' . $bc['name'] : null ),
 		'now'          => $existing ? array( 'title' => $existing->post_title, 'status' => $existing->post_status, 'publish_date' => $existing->post_date, 'has_video' => trim( $video ) !== '' ) : null,
 	);
 
@@ -5190,6 +5248,9 @@ function bsb_sermon_push( WP_REST_Request $req ) {
 		bsb_sermon_acf( 'sermon_date', str_replace( '-', '', $date ), $id );
 		if ( $bulletin ) {
 			bsb_sermon_acf( 'bulletin_link', array( (int) $bulletin->ID ), $id );
+		}
+		if ( $bc && trim( (string) get_post_meta( $id, 'video_embed', true ) ) === '' ) {
+			bsb_sermon_acf( 'video_embed', $bc['embed'], $id );
 		}
 	} else {
 		update_post_meta( $id, 'sermon_date', str_replace( '-', '', $date ) );
